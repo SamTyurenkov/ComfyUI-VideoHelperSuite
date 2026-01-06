@@ -225,6 +225,7 @@ def ffmpeg_frame_generator(video, force_rate, frame_load_cap, start_time,
             args_input + ["-pix_fmt", "rgba64le"] + post_seek
 
     vfilters = []
+    vfilters.append(f"scale=in_color_matrix=bt709:out_color_matrix=bt709:in_range=tv:out_range=full,format=rgba64le")
     if force_rate != 0:
         vfilters.append("fps=fps="+str(force_rate))
     if custom_width != 0 or custom_height != 0:
@@ -239,7 +240,9 @@ def ffmpeg_frame_generator(video, force_rate, frame_load_cap, start_time,
     else:
         size = size_base
     if len(vfilters) > 0:
-        args_all_frames += ["-vf", ",".join(vfilters)]
+        vfilters_str = ",".join(vfilters)
+        print(f"Final vfilters: {vfilters_str}")
+        args_all_frames += ["-vf", vfilters_str]
     yieldable_frames = (force_rate or fps_base)*duration
     if frame_load_cap > 0:
         args_all_frames += ["-frames:v", str(frame_load_cap)]

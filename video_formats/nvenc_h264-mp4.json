@@ -3,7 +3,7 @@
     [
         "-n", "-c:v", "h264_nvenc",
         "-pix_fmt", ["pix_fmt", ["yuv420p", "p010le"]],
-        "-vf", "scale=out_color_matrix=bt709",
+        "-vf", "scale=in_color_matrix=bt709:out_color_matrix=bt709:in_range=full:out_range=tv",
         "-color_range", "tv", "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"
     ],
     "fake_trc": "bt709",
