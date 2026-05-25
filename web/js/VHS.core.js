@@ -167,10 +167,15 @@ function useKVState(nodeType) {
         });
     })
 }
-var helpDOM;
-if (!app.helpDOM) {
+var helpDOM = app.VHSHelp;
+if (!app.VHSHelp) {
     helpDOM = document.createElement("div");
     app.VHSHelp = helpDOM
+} else {
+    app.extensionManager.dialog
+      .showErrorDialog('Please check your custom_nodes directory and manually remove the duplicate.',
+                       { title: 'Duplicate VHS install detected' })
+    throw new Error('Duplicate VHS install detected. Check your custom_nodes directory')
 }
 function initHelpDOM() {
     let parentDOM = document.createElement("div");
@@ -841,6 +846,8 @@ function addAudioPreview(nodeType, isInput=true) {
     chainCallback(nodeType.prototype, "onNodeCreated", function() {
         var element = document.createElement("audio");
         element.controls = true
+        element.style['width'] = "100%"
+        element.style['minHeight'] = "50px"
         const previewNode = this;
         var previewWidget = this.addDOMWidget("audiopreview", "preview", element, {
             serialize: false,
@@ -1610,7 +1617,8 @@ function inner_value_change(widget, value, node, pos) {
 }
 function drawAnnotated(ctx, node, widget_width, y, H) {
   const litegraph_base = LiteGraph
-  const show_text = app.canvas.ds.scale >= (app.canvas.low_quality_zoom_threshold ?? 0.5)
+  // In vueNodes mode, always show text since Vue renders at 1:1 scale
+  const show_text = LiteGraph.vueNodesMode || app.canvas.ds.scale >= (app.canvas.low_quality_zoom_threshold ?? 0.5)
   const margin = 15
   ctx.strokeStyle = litegraph_base.WIDGET_OUTLINE_COLOR
   ctx.fillStyle = litegraph_base.WIDGET_BGCOLOR
