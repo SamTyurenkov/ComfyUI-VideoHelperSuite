@@ -180,7 +180,7 @@ def ffmpeg_process(args, video_format, video_metadata, file_path, env):
                 #Res was not set
                 print(err.decode(*ENCODE_ARGS), end="", file=sys.stderr)
                 logger.warn("An error occurred when saving with metadata")
-    if res != b'':
+    if res is None or b"Error" in res:
         with subprocess.Popen(args + [file_path], stderr=subprocess.PIPE,
                               stdin=subprocess.PIPE, env=env) as proc:
             try:
