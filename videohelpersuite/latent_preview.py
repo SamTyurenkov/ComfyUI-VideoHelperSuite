@@ -82,12 +82,20 @@ class WrappedPreviewer(latent_preview.LatentPreviewer):
             ind = (ind + 1) % leng
     def decode_latent_to_preview(self, x0):
         if hasattr(self, 'taesd'):
+            # VIDEO_TAES (lighttaew*, taehv, …) load as comfy.sd.VAE + TAEHV.
+            # ComfyUI's TAEHVPreviewerImpl decodes x0[:1, :, :1]; each preview
+            # frame must use T=1, not N stacked as a fake temporal axis.
+            if getattr(self.taesd, 'latent_dim', None) == 3:
+                if x0.ndim == 4:
+                    x0 = x0.unsqueeze(2)
+                decoded = self.taesd.decode(x0)
+                if decoded.ndim == 5:
+                    return decoded[:, 0]
+                return decoded
             x_sample = self.taesd.decode(x0)
             if x_sample.ndim == 5:
-                # Video TAESDs (e.g. lighttaew2_1, lighttaew2_2) return
-                # [B, T, H, W, C] with channels-last; merge the temporal
-                # dim into batch so the downstream interpolate path keeps
-                # a 2-D spatial layout. (#667)
+                # Standalone video TAESD modules return [B, T, H, W, C];
+                # merge T into batch for the interpolate path. (#667)
                 return x_sample.reshape(-1, *x_sample.shape[2:])
             return x_sample.movedim(1, 3)
         else:
