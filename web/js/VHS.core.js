@@ -2514,12 +2514,19 @@ function getLatentPreviewCtx(id, width, height) {
 }
 let animateIntervals = {}
 function beginLatentPreview(id, previewImages, rate) {
+    let node = getNodeById(id)
+    //A subgraph execution id like "119:84" is walked prefix-by-prefix by the
+    //VHS_latentpreview handler below; intermediate prefixes (e.g. "119") may
+    //not resolve to a real node. Skip those instead of throwing on
+    //node.progress. Mirrors the `?.` guard used inside the interval below.
+    if (node == undefined) {
+        return
+    }
     latentPreviewNodes.add(id)
     if (animateIntervals[id]) {
         clearTimeout(animateIntervals[id])
     }
     let displayIndex = 0
-    let node = getNodeById(id)
     //While progress is safely cleared on execution completion.
     //Initial progress must be started here to avoid a race condition
     node.progress = 0
@@ -2553,6 +2560,32 @@ api.addEventListener('VHS_latentpreview', ({ detail }) => {
         beginLatentPreview(id, previewImages, detail.rate)
     }
 });
+//The final result is delivered once via the live `executed` event. If the
+//websocket was down at that moment (aiohttp drops it when a slow node blocks
+//the event loop past the heartbeat, common behind reverse-proxy tunnels), the
+//event is lost and the preview node stays blank. On reconnect, re-pull history
+//and re-apply each VHS preview node's `gifs` output so results still show up.
+async function restorePreviewsFromHistory() {
+    let history
+    try {
+        const resp = await api.fetchApi('/history?max_items=20')
+        history = await resp.json()
+    } catch (e) {
+        return
+    }
+    //history is keyed by prompt_id in chronological order; letting later
+    //entries overwrite earlier ones leaves each node showing its newest output.
+    for (const entry of Object.values(history ?? {})) {
+        const outputs = entry?.outputs ?? {}
+        for (const [nodeId, out] of Object.entries(outputs)) {
+            if (!out?.gifs?.length) {
+                continue
+            }
+            getNodeById(nodeId)?.updateParameters?.(out.gifs[0], true)
+        }
+    }
+}
+api.addEventListener('reconnected', restorePreviewsFromHistory)
 let td = new TextDecoder()
 api.addEventListener('b_preview', async (e) => {
     if (Object.keys(animateIntervals).length == 0) {
