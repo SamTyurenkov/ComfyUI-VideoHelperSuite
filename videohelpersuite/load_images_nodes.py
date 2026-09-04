@@ -106,7 +106,7 @@ def load_images(directory: str, image_load_cap: int = 0, skip_first_images: int 
         gen, width, height, has_alpha = meta_batch.inputs[unique_id]
 
     if meta_batch is not None:
-        gen = itertools.islice(gen, meta_batch.frames_per_batch)
+        gen = itertools.islice(gen, int(meta_batch.frames_per_batch))
     images = torch.from_numpy(np.fromiter(gen, np.dtype((np.float32, (height, width, 3 + has_alpha)))))
     if has_alpha:
         #tensors are not continuous. Rewrite will be required if this is an issue

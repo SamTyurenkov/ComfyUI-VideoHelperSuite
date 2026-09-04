@@ -815,7 +815,11 @@ class PruneOutputs:
                 os.remove(file)
         return ()
 
+_batch_states = {}
+
 class BatchManager:
+    NOT_IDEMPOTENT = True
+
     def __init__(self, frames_per_batch=-1):
         self.frames_per_batch = frames_per_batch
         self.inputs = {}
@@ -836,9 +840,10 @@ class BatchManager:
         return len(self.inputs) > 0
     def close_inputs(self):
         for key in self.inputs:
-            if getattr(self.inputs[key][-1], "gi_suspended", False):
+            gen = self.inputs[key][0]
+            if getattr(gen, "gi_suspended", False):
                 try:
-                    self.inputs[key][-1].send(1)
+                    gen.send(1)
                 except StopIteration:
                     pass
         self.inputs = {}
@@ -861,16 +866,41 @@ class BatchManager:
     FUNCTION = "update_batch"
 
     def update_batch(self, frames_per_batch, prompt=None, unique_id=None):
+        frames_per_batch = int(frames_per_batch)
         if unique_id is not None and prompt is not None:
-            requeue = prompt[unique_id]['inputs'].get('requeue', 0)
+            requeue = int(prompt[unique_id]['inputs'].get('requeue', 0))
         else:
             requeue = 0
-        if requeue == 0:
+        if unique_id is not None:
+            if requeue == 0:
+                if unique_id in _batch_states:
+                    _batch_states[unique_id].reset()
+                state = BatchManager(frames_per_batch)
+                state.unique_id = unique_id
+                _batch_states[unique_id] = state
+            else:
+                state = _batch_states.get(unique_id)
+                if state is None:
+                    raise RuntimeError(
+                        "Meta Batch session was lost between batches. "
+                        "This usually happens with --cache-none or nodes that clear ComfyUI cache between runs. "
+                        "Remove --cache-none from your launch script, or disable cache clearing in other nodes."
+                    )
+                state.frames_per_batch = frames_per_batch
+            self.__dict__.update(state.__dict__)
+        elif requeue == 0:
             self.reset()
             self.frames_per_batch = frames_per_batch
             self.unique_id = unique_id
         else:
             num_batches = (self.total_frames+self.frames_per_batch-1)//frames_per_batch
+            print(f'Meta-Batch {requeue}/{num_batches}')
+        if requeue > 0 and unique_id is not None:
+            total = self.total_frames
+            if total != float('inf') and total == total:
+                num_batches = (int(total) + self.frames_per_batch - 1) // self.frames_per_batch
+            else:
+                num_batches = '?'
             print(f'Meta-Batch {requeue}/{num_batches}')
         #onExecuted seems to not be called unless some message is sent
         return (self,)

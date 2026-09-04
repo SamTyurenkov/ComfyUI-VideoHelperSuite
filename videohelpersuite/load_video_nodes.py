@@ -333,7 +333,7 @@ def load_video(meta_batch=None, unique_id=None, memory_limit_mb=None, vae=None,
         if meta_batch is not None:
             meta_batch.inputs[unique_id] = (gen, width, height, fps, duration, total_frames, target_frame_time, yieldable_frames, new_width, new_height, alpha)
             if yieldable_frames:
-                meta_batch.total_frames = min(meta_batch.total_frames, yieldable_frames)
+                meta_batch.total_frames = min(meta_batch.total_frames, int(yieldable_frames))
 
     else:
         (gen, width, height, fps, duration, total_frames, target_frame_time, yieldable_frames, new_width, new_height, alpha) = meta_batch.inputs[unique_id]
@@ -366,7 +366,7 @@ def load_video(meta_batch=None, unique_id=None, memory_limit_mb=None, vae=None,
                 raise RuntimeError(f"The chosen frames per batch is incompatible with the selected format. Try {suggested}")
         if meta_batch.frames_per_batch > max_loadable_frames:
             raise RuntimeError(f"Meta Batch set to {meta_batch.frames_per_batch} frames but only {max_loadable_frames} can fit in memory")
-        gen = itertools.islice(gen, meta_batch.frames_per_batch)
+        gen = itertools.islice(gen, int(meta_batch.frames_per_batch))
     else:
         original_gen = gen
         gen = itertools.islice(gen, max_loadable_frames)
