@@ -827,6 +827,7 @@ class BatchManager:
         self.unique_id = None
         self.has_closed_inputs = False
         self.total_frames = float('inf')
+        self.frames_loaded = 0
     def reset(self):
         self.close_inputs()
         for key in self.outputs:
@@ -835,7 +836,10 @@ class BatchManager:
                     self.outputs[key][-1].send(None)
                 except StopIteration:
                     pass
+        uid = self.unique_id
         self.__init__(self.frames_per_batch)
+        if uid is not None and _batch_states.get(uid) is self:
+            del _batch_states[uid]
     def has_open_inputs(self):
         return len(self.inputs) > 0
     def close_inputs(self):
@@ -887,20 +891,20 @@ class BatchManager:
                         "Remove --cache-none from your launch script, or disable cache clearing in other nodes."
                     )
                 state.frames_per_batch = frames_per_batch
-            self.__dict__.update(state.__dict__)
-        elif requeue == 0:
+            total = state.total_frames
+            if total != float('inf') and total == total:
+                num_batches = (int(total) + state.frames_per_batch - 1) // state.frames_per_batch
+                if requeue >= num_batches:
+                    state.has_closed_inputs = True
+            if requeue > 0:
+                print(f'Meta-Batch {requeue}/{num_batches if total != float("inf") and total == total else "?"}')
+            return (state,)
+        if requeue == 0:
             self.reset()
             self.frames_per_batch = frames_per_batch
             self.unique_id = unique_id
-        else:
-            num_batches = (self.total_frames+self.frames_per_batch-1)//frames_per_batch
-            print(f'Meta-Batch {requeue}/{num_batches}')
-        if requeue > 0 and unique_id is not None:
-            total = self.total_frames
-            if total != float('inf') and total == total:
-                num_batches = (int(total) + self.frames_per_batch - 1) // self.frames_per_batch
-            else:
-                num_batches = '?'
+        elif self.total_frames != float('inf'):
+            num_batches = (int(self.total_frames) + self.frames_per_batch - 1) // frames_per_batch
             print(f'Meta-Batch {requeue}/{num_batches}')
         #onExecuted seems to not be called unless some message is sent
         return (self,)

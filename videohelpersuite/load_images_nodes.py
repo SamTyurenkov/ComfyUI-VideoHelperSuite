@@ -116,6 +116,16 @@ def load_images(directory: str, image_load_cap: int = 0, skip_first_images: int 
         masks = torch.zeros((images.size(0), 64, 64), dtype=torch.float32, device="cpu")
     if len(images) == 0:
         raise FileNotFoundError(f"No images could be loaded from directory '{directory}'.")
+    if meta_batch is not None:
+        batch_size = int(meta_batch.frames_per_batch)
+        meta_batch.frames_loaded += len(images)
+        total_frames = meta_batch.total_frames
+        if len(images) < batch_size:
+            meta_batch.has_closed_inputs = True
+            meta_batch.inputs.pop(unique_id, None)
+        elif total_frames != float('inf') and meta_batch.frames_loaded >= int(total_frames):
+            meta_batch.has_closed_inputs = True
+            meta_batch.inputs.pop(unique_id, None)
     return images, masks, images.size(0)
 
 class LoadImagesFromDirectoryUpload:

@@ -387,6 +387,16 @@ def load_video(meta_batch=None, unique_id=None, memory_limit_mb=None, vae=None,
             pass
     if len(images) == 0:
         raise RuntimeError("No frames generated")
+    if meta_batch is not None:
+        batch_size = int(meta_batch.frames_per_batch)
+        meta_batch.frames_loaded += len(images)
+        total_frames = meta_batch.total_frames
+        if len(images) < batch_size:
+            meta_batch.has_closed_inputs = True
+            meta_batch.inputs.pop(unique_id, None)
+        elif total_frames != float('inf') and meta_batch.frames_loaded >= int(total_frames):
+            meta_batch.has_closed_inputs = True
+            meta_batch.inputs.pop(unique_id, None)
     if 'frames' in format and len(images) % format['frames'][0] != format['frames'][1]:
         err_msg = f"The number of frames loaded {len(images)}, does not match the requirements of the currently selected format."
         if len(format['frames']) > 2 and format['frames'][2]:
