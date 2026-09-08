@@ -217,7 +217,7 @@ class MergeLatents:
                 "merge_strategy": (MergeStrategies.list_all,),
                 "scale_method": (ScaleMethods.list_all,),
                 "crop": (CropMethods.list_all,),
-                "per_batch": ("INT", {"default": 0, "min": 0, "max": BIGMAX}),
+                "per_batch": ("INT", {"default": 0, "min": 0, "max": BIGMAX, "step": 1}),
             }
         }
     
@@ -247,7 +247,7 @@ class MergeImages:
                 "merge_strategy": (MergeStrategies.list_all,),
                 "scale_method": (ScaleMethods.list_all,),
                 "crop": (CropMethods.list_all,),
-                "per_batch": ("INT", {"default": 0, "min": 0, "max": BIGMAX}),
+                "per_batch": ("INT", {"default": 0, "min": 0, "max": BIGMAX, "step": 1}),
             }
         }
     
@@ -274,7 +274,7 @@ class MergeMasks:
                 "merge_strategy": (MergeStrategies.list_all,),
                 "scale_method": (ScaleMethods.list_all,),
                 "crop": (CropMethods.list_all,),
-                "per_batch": ("INT", {"default": 0, "min": 0, "max": BIGMAX}),
+                "per_batch": ("INT", {"default": 0, "min": 0, "max": BIGMAX, "step": 1}),
             }
         }
     
