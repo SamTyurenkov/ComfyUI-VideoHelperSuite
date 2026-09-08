@@ -486,6 +486,7 @@ descriptions = {
         'merge_strategy': common_descriptions['merge_strategy'],
         'scale_method': common_descriptions['scale_method'],
         'crop': common_descriptions['crop_method'],
+        'per_batch': 'Chunk size when copying/scaling. Does not reduce the size of the returned IMAGE tensor.',
         },
 
     }],
@@ -570,6 +571,99 @@ descriptions = {
         },
      'Outputs': {
          'Filename': 'A string representing a file path to the most recently modified file.',
+        },
+    }],
+  "VHS_ImagesToDisk": ['Images to Disk 🎥🅥🅗🅢', short_desc('Encode an IMAGE batch to a temp mp4 under /root/autodl-tmp and return a cheap disk handle'),
+    'Writes frames through ffmpeg one at a time. The returned VHS_DISK_MEDIA is a path+metadata dict, not a tensor. Downstream merge/combine can then avoid a second full-RAM copy.',
+    {'Inputs': {
+        'images': 'IMAGE batch to dump. The input tensor still exists in Comfy cache until eviction; this node does not clone it.',
+        },
+     'Outputs': {
+         'disk': 'VHS_DISK_MEDIA handle (path, fps, count, size)',
+         'count': 'Number of frames written',
+        },
+     'Widgets': {
+         'frame_rate': 'FPS stored in the intermediate file',
+         'base_dir': 'Directory for temp clips. Defaults to /root/autodl-tmp/vhs_disk, falls back to Comfy temp',
+         'encoder': 'auto uses NVENC when present, otherwise libx264',
+         'quality': 'CRF/CQ. Lower is higher quality. 12 is a high-quality intermediate',
+        },
+    }],
+  "VHS_PathToDisk": ['Path to Disk 🎥🅥🅗🅢', short_desc('Wrap an existing video file as VHS_DISK_MEDIA without decoding frames'),
+    {'Inputs': {
+        'video': 'Path to an mp4/webm/mkv/mov file',
+        },
+     'Outputs': {
+         'disk': 'VHS_DISK_MEDIA handle',
+         'count': 'Frame count from ffprobe',
+        },
+    }],
+  "VHS_MergeDisk": ['Merge Disk 🎥🅥🅗🅢', short_desc('Concatenate two disk clips with ffmpeg without loading them into RAM'),
+    'If resolution and fps match, this is a stream copy. Otherwise B (or A) is scaled in ffmpeg.',
+    {'Inputs': {
+        'disk_A': 'First clip',
+        'disk_B': 'Second clip, appended after A',
+        },
+     'Outputs': {
+         'disk': 'Concatenated clip',
+         'count': 'A.count + B.count',
+        },
+     'Widgets': {
+         'merge_strategy': common_descriptions['merge_strategy'],
+         'encoder': 'Used only when a re-encode is required',
+         'quality': 'CRF/CQ for re-encode',
+        },
+    }],
+  "VHS_AppendImagesToDisk": ['Append Images to Disk 🎥🅥🅗🅢', short_desc('Encode a small IMAGE batch and concat it onto a disk clip'),
+    'Use this for a 1-frame seam instead of VHS_MergeImages on a 4K IMAGE batch.',
+    {'Inputs': {
+        'disk': 'Existing disk clip (not loaded into RAM)',
+        'images': 'Frames to append. Keep this small.',
+        },
+     'Outputs': {
+         'disk': 'Clip with images appended',
+         'count': 'New frame count',
+        },
+    }],
+  "VHS_LoadDiskFrames": ['Load Disk Frames 🎥🅥🅗🅢', short_desc('Decode a window of frames from disk into IMAGE'),
+    'Only this window lives in RAM. start=-1 is the last frame. count=0 loads from start to the end — that will OOM on long 4K clips.',
+    {'Inputs': {
+        'disk': 'VHS_DISK_MEDIA handle',
+        },
+     'Outputs': {
+         'IMAGE': 'Decoded RGB float32 frames',
+         'count': 'Frames actually loaded',
+        },
+     'Widgets': {
+         'start': 'First frame index. Negative values count from the end',
+         'count': 'How many frames to decode. Default 1',
+        },
+    }],
+  "VHS_DiskInfo": ['Disk Info 🎥🅥🅗🅢', short_desc('Read fps/count/size from a disk handle without decoding'),
+    {'Inputs': {
+        'disk': 'VHS_DISK_MEDIA handle',
+        },
+     'Outputs': {
+         'path': 'Absolute file path',
+         'fps': 'Frame rate',
+         'count': 'Frame count',
+         'width': 'Width',
+         'height': 'Height',
+         'duration': 'Duration in seconds',
+        },
+    }],
+  "VHS_DiskCombine": ['Disk Combine 🎥🅥🅗🅢', short_desc('Copy a disk clip into Comfy output, optionally muxing AUDIO'),
+    'Does not re-encode video. Replaces Video Combine when the images already live on disk.',
+    {'Inputs': {
+        'disk': 'VHS_DISK_MEDIA handle',
+        'audio': 'Optional AUDIO to mux',
+        },
+     'Outputs': {
+         'Filenames': 'VHS_FILENAMES like Video Combine',
+        },
+     'Widgets': {
+         'filename_prefix': 'Output name prefix',
+         'save_output': 'If true, write to output directory; otherwise temp',
         },
     }],
 }
