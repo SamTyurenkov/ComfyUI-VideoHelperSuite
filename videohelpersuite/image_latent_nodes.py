@@ -3,7 +3,8 @@ import torch
 
 import comfy.utils
 
-from .utils import BIGMIN, BIGMAX, select_indexes_from_str, convert_str_to_indexes, select_indexes
+from .utils import BIGMIN, BIGMAX, select_indexes_from_str, convert_str_to_indexes, select_indexes, \
+        effective_batch_size, write_tensor_chunks
 
 
 class MergeStrategies:
@@ -30,6 +31,109 @@ class CropMethods:
     CENTER = "center"
 
     list_all = [DISABLED, CENTER]
+
+
+def resolve_merge_template(height_a, width_a, height_b, width_b, merge_strategy):
+    a_size = width_a * height_a
+    b_size = width_b * height_b
+    use_a_as_template = True
+    if merge_strategy == MergeStrategies.MATCH_A:
+        pass
+    elif merge_strategy == MergeStrategies.MATCH_B:
+        use_a_as_template = False
+    elif merge_strategy in (MergeStrategies.MATCH_SMALLER, MergeStrategies.MATCH_LARGER):
+        if a_size <= b_size:
+            use_a_as_template = merge_strategy == MergeStrategies.MATCH_SMALLER
+        else:
+            use_a_as_template = merge_strategy == MergeStrategies.MATCH_LARGER
+    if use_a_as_template:
+        return height_a, width_a, False, True
+    return height_b, width_b, True, False
+
+
+def merge_image_batches(images_a, images_b, merge_strategy, scale_method, crop, per_batch=0):
+    total = images_a.shape[0] + images_b.shape[0]
+    needs_scale = images_a.shape[1] != images_b.shape[1] or images_a.shape[2] != images_b.shape[2]
+    target_h, target_w, scale_a, scale_b = resolve_merge_template(
+        images_a.shape[1], images_a.shape[2], images_b.shape[1], images_b.shape[2], merge_strategy
+    )
+    batch_size = effective_batch_size(total, images_a.shape[1:], per_batch, images_a.element_size())
+
+    def scale_chunk(chunk, do_scale):
+        if not do_scale:
+            return chunk
+        chunk = chunk.movedim(-1, 1)
+        chunk = comfy.utils.common_upscale(chunk, target_w, target_h, scale_method, crop)
+        return chunk.movedim(1, -1)
+
+    if not needs_scale and batch_size >= total:
+        return torch.cat((images_a, images_b), dim=0)
+
+    if needs_scale:
+        first = scale_chunk(images_a[:1], scale_a)
+    else:
+        first = images_a[:1]
+    out = torch.empty((total, *first.shape[1:]), dtype=first.dtype, device=first.device)
+    del first
+    offset = write_tensor_chunks(out, 0, images_a, batch_size, lambda c: scale_chunk(c, scale_a))
+    write_tensor_chunks(out, offset, images_b, batch_size, lambda c: scale_chunk(c, scale_b))
+    return out
+
+
+def merge_latent_batches(samples_a, samples_b, merge_strategy, scale_method, crop, per_batch=0):
+    total = samples_a.shape[0] + samples_b.shape[0]
+    needs_scale = samples_a.shape[2] != samples_b.shape[2] or samples_a.shape[3] != samples_b.shape[3]
+    target_h, target_w, scale_a, scale_b = resolve_merge_template(
+        samples_a.shape[2], samples_a.shape[3], samples_b.shape[2], samples_b.shape[3], merge_strategy
+    )
+    batch_size = effective_batch_size(total, samples_a.shape[1:], per_batch, samples_a.element_size())
+
+    def scale_chunk(chunk, do_scale):
+        if not do_scale:
+            return chunk
+        return comfy.utils.common_upscale(chunk, target_w, target_h, scale_method, crop)
+
+    if not needs_scale and batch_size >= total:
+        return torch.cat((samples_a, samples_b), dim=0)
+
+    if needs_scale:
+        first = scale_chunk(samples_a[:1], scale_a)
+    else:
+        first = samples_a[:1]
+    out = torch.empty((total, *first.shape[1:]), dtype=first.dtype, device=first.device)
+    del first
+    offset = write_tensor_chunks(out, 0, samples_a, batch_size, lambda c: scale_chunk(c, scale_a))
+    write_tensor_chunks(out, offset, samples_b, batch_size, lambda c: scale_chunk(c, scale_b))
+    return out
+
+
+def merge_mask_batches(mask_a, mask_b, merge_strategy, scale_method, crop, per_batch=0):
+    total = mask_a.shape[0] + mask_b.shape[0]
+    needs_scale = mask_a.shape[1] != mask_b.shape[1] or mask_a.shape[2] != mask_b.shape[2]
+    target_h, target_w, scale_a, scale_b = resolve_merge_template(
+        mask_a.shape[1], mask_a.shape[2], mask_b.shape[1], mask_b.shape[2], merge_strategy
+    )
+    batch_size = effective_batch_size(total, mask_a.shape[1:], per_batch, mask_a.element_size())
+
+    def scale_chunk(chunk, do_scale):
+        if not do_scale:
+            return chunk
+        chunk = torch.unsqueeze(chunk, 1)
+        chunk = comfy.utils.common_upscale(chunk, target_w, target_h, scale_method, crop)
+        return torch.squeeze(chunk, 1)
+
+    if not needs_scale and batch_size >= total:
+        return torch.cat((mask_a, mask_b), dim=0)
+
+    if needs_scale:
+        first = scale_chunk(mask_a[:1], scale_a)
+    else:
+        first = mask_a[:1]
+    out = torch.empty((total, *first.shape[1:]), dtype=first.dtype, device=first.device)
+    del first
+    offset = write_tensor_chunks(out, 0, mask_a, batch_size, lambda c: scale_chunk(c, scale_a))
+    write_tensor_chunks(out, offset, mask_b, batch_size, lambda c: scale_chunk(c, scale_b))
+    return out
 
 
 class SplitLatents:
@@ -113,6 +217,7 @@ class MergeLatents:
                 "merge_strategy": (MergeStrategies.list_all,),
                 "scale_method": (ScaleMethods.list_all,),
                 "crop": (CropMethods.list_all,),
+                "per_batch": ("INT", {"default": 0, "min": 0, "max": BIGMAX}),
             }
         }
     
@@ -122,35 +227,13 @@ class MergeLatents:
     RETURN_NAMES = ("LATENT", "count",)
     FUNCTION = "merge"
 
-    def merge(self, latents_A: dict, latents_B: dict, merge_strategy: str, scale_method: str, crop: str):
-        latents = []
+    def merge(self, latents_A: dict, latents_B: dict, merge_strategy: str, scale_method: str, crop: str, per_batch=0):
         latents_A = latents_A.copy()["samples"]
         latents_B = latents_B.copy()["samples"]
 
-        # TODO: handle other properties on latents besides just "samples"
-        # if not same dimensions, do scaling
-        if latents_A.shape[3] != latents_B.shape[3] or latents_A.shape[2] != latents_B.shape[2]:
-            A_size = latents_A.shape[3] * latents_A.shape[2]
-            B_size = latents_B.shape[3] * latents_B.shape[2]
-            # determine which to use
-            use_A_as_template = True
-            if merge_strategy == MergeStrategies.MATCH_A:
-                pass
-            elif merge_strategy == MergeStrategies.MATCH_B:
-                use_A_as_template = False
-            elif merge_strategy in (MergeStrategies.MATCH_SMALLER, MergeStrategies.MATCH_LARGER):
-                if A_size <= B_size:
-                    use_A_as_template = True if merge_strategy == MergeStrategies.MATCH_SMALLER else False
-            # apply scaling
-            if use_A_as_template:
-                latents_B = comfy.utils.common_upscale(latents_B, latents_A.shape[3], latents_A.shape[2], scale_method, crop)
-            else:
-                latents_A = comfy.utils.common_upscale(latents_A, latents_B.shape[3], latents_B.shape[2], scale_method, crop)
-
-        latents.append(latents_A)
-        latents.append(latents_B)
-
-        merged = {"samples": torch.cat(latents, dim=0)}
+        merged = {"samples": merge_latent_batches(
+            latents_A, latents_B, merge_strategy, scale_method, crop, per_batch
+        )}
         return (merged, len(merged["samples"]),)
 
 
@@ -164,6 +247,7 @@ class MergeImages:
                 "merge_strategy": (MergeStrategies.list_all,),
                 "scale_method": (ScaleMethods.list_all,),
                 "crop": (CropMethods.list_all,),
+                "per_batch": ("INT", {"default": 0, "min": 0, "max": BIGMAX}),
             }
         }
     
@@ -173,35 +257,10 @@ class MergeImages:
     RETURN_NAMES = ("IMAGE", "count",)
     FUNCTION = "merge"
 
-    def merge(self, images_A: Tensor, images_B: Tensor, merge_strategy: str, scale_method: str, crop: str):
-        images = []
-        # if not same dimensions, do scaling
-        if images_A.shape[3] != images_B.shape[3] or images_A.shape[2] != images_B.shape[2]:
-            images_A = images_A.movedim(-1,1)
-            images_B = images_B.movedim(-1,1)
-
-            A_size = images_A.shape[3] * images_A.shape[2]
-            B_size = images_B.shape[3] * images_B.shape[2]
-            # determine which to use
-            use_A_as_template = True
-            if merge_strategy == MergeStrategies.MATCH_A:
-                pass
-            elif merge_strategy == MergeStrategies.MATCH_B:
-                use_A_as_template = False
-            elif merge_strategy in (MergeStrategies.MATCH_SMALLER, MergeStrategies.MATCH_LARGER):
-                if A_size <= B_size:
-                    use_A_as_template = True if merge_strategy == MergeStrategies.MATCH_SMALLER else False
-            # apply scaling
-            if use_A_as_template:
-                images_B = comfy.utils.common_upscale(images_B, images_A.shape[3], images_A.shape[2], scale_method, crop)
-            else:
-                images_A = comfy.utils.common_upscale(images_A, images_B.shape[3], images_B.shape[2], scale_method, crop)
-            images_A = images_A.movedim(1,-1)
-            images_B = images_B.movedim(1,-1)
-
-        images.append(images_A)
-        images.append(images_B)
-        all_images = torch.cat(images, dim=0)
+    def merge(self, images_A: Tensor, images_B: Tensor, merge_strategy: str, scale_method: str, crop: str, per_batch=0):
+        all_images = merge_image_batches(
+            images_A, images_B, merge_strategy, scale_method, crop, per_batch
+        )
         return (all_images, all_images.size(0),)
 
 
@@ -215,6 +274,7 @@ class MergeMasks:
                 "merge_strategy": (MergeStrategies.list_all,),
                 "scale_method": (ScaleMethods.list_all,),
                 "crop": (CropMethods.list_all,),
+                "per_batch": ("INT", {"default": 0, "min": 0, "max": BIGMAX}),
             }
         }
     
@@ -224,36 +284,10 @@ class MergeMasks:
     RETURN_NAMES = ("MASK", "count",)
     FUNCTION = "merge"
 
-    def merge(self, mask_A: Tensor, mask_B: Tensor, merge_strategy: str, scale_method: str, crop: str):
-        masks = []
-        # if not same dimensions, do scaling
-        if mask_A.shape[2] != mask_B.shape[2] or mask_A.shape[1] != mask_B.shape[1]:
-            A_size = mask_A.shape[2] * mask_A.shape[1]
-            B_size = mask_B.shape[2] * mask_B.shape[1]
-            # determine which to use
-            use_A_as_template = True
-            if merge_strategy == MergeStrategies.MATCH_A:
-                pass
-            elif merge_strategy == MergeStrategies.MATCH_B:
-                use_A_as_template = False
-            elif merge_strategy in (MergeStrategies.MATCH_SMALLER, MergeStrategies.MATCH_LARGER):
-                if A_size <= B_size:
-                    use_A_as_template = True if merge_strategy == MergeStrategies.MATCH_SMALLER else False
-            # add dimension where image channels would be expected to work with common_upscale
-            mask_A = torch.unsqueeze(mask_A, 1)
-            mask_B = torch.unsqueeze(mask_B, 1)
-            # apply scaling
-            if use_A_as_template:
-                mask_B = comfy.utils.common_upscale(mask_B, mask_A.shape[3], mask_A.shape[2], scale_method, crop)
-            else:
-                mask_A = comfy.utils.common_upscale(mask_A, mask_B.shape[3], mask_B.shape[2], scale_method, crop)
-            # undo dimension increase
-            mask_A = torch.squeeze(mask_A, 1)
-            mask_B = torch.squeeze(mask_B, 1)
-
-        masks.append(mask_A)
-        masks.append(mask_B)
-        all_masks = torch.cat(masks, dim=0)
+    def merge(self, mask_A: Tensor, mask_B: Tensor, merge_strategy: str, scale_method: str, crop: str, per_batch=0):
+        all_masks = merge_mask_batches(
+            mask_A, mask_B, merge_strategy, scale_method, crop, per_batch
+        )
         return (all_masks, all_masks.size(0),)
 
 
@@ -406,10 +440,11 @@ class RepeatLatents:
         latents_len = len(latents["samples"])
         for key, val in latents.items():
             if type(val) == Tensor and len(val) == latents_len:
-                full_latents = []
-                for _ in range(0, multiply_by):
-                    full_latents.append(latents[key])
-                latents[key] = torch.cat(full_latents, dim=0)
+                total = latents_len * multiply_by
+                out = torch.empty((total, *val.shape[1:]), dtype=val.dtype, device=val.device)
+                for n in range(multiply_by):
+                    out[n * latents_len:(n + 1) * latents_len] = val
+                latents[key] = out
         return (latents, latents["samples"].size(0),)
 
 
@@ -430,11 +465,11 @@ class RepeatImages:
     FUNCTION = "duplicate_input"
 
     def duplicate_input(self, images: Tensor, multiply_by: int):
-        full_images = []
-        for n in range(0, multiply_by):
-            full_images.append(images)
-        new_images = torch.cat(full_images, dim=0)
-        return (new_images, new_images.size(0),)
+        total = images.shape[0] * multiply_by
+        out = torch.empty((total, *images.shape[1:]), dtype=images.dtype, device=images.device)
+        for n in range(multiply_by):
+            out[n * images.shape[0]:(n + 1) * images.shape[0]] = images
+        return (out, out.size(0),)
 
 
 class RepeatMasks:
@@ -454,11 +489,11 @@ class RepeatMasks:
     FUNCTION = "duplicate_input"
 
     def duplicate_input(self, mask: Tensor, multiply_by: int):
-        full_masks = []
-        for n in range(0, multiply_by):
-            full_masks.append(mask)
-        new_mask = torch.cat(full_masks, dim=0)
-        return (new_mask, new_mask.size(0),)
+        total = mask.shape[0] * multiply_by
+        out = torch.empty((total, *mask.shape[1:]), dtype=mask.dtype, device=mask.device)
+        for n in range(multiply_by):
+            out[n * mask.shape[0]:(n + 1) * mask.shape[0]] = mask
+        return (out, out.size(0),)
 
 
 select_description = """Use comma-separated indexes to select items in the given order.
