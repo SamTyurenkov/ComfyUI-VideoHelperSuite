@@ -486,7 +486,6 @@ descriptions = {
         'merge_strategy': common_descriptions['merge_strategy'],
         'scale_method': common_descriptions['scale_method'],
         'crop': common_descriptions['crop_method'],
-        'per_batch': 'Chunk size when copying/scaling. Does not reduce the size of the returned IMAGE tensor.',
         },
 
     }],

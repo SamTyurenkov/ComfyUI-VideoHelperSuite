@@ -20,61 +20,7 @@ BIGMAX = (2**53-1)
 
 DIMMAX = 8192
 
-# Target working memory for chunked tensor ops (~512MB). 0 per_batch uses this.
-CHUNK_TARGET_BYTES = 512 * 1024 * 1024
-
 ENCODE_ARGS = ("utf-8", 'backslashreplace')
-
-def effective_batch_size(num_frames, frame_shape, per_batch, elem_size=None):
-    """Return chunk size for batched tensor ops. per_batch=0 enables auto sizing."""
-    if per_batch > 0:
-        return min(per_batch, num_frames)
-    if num_frames <= 1:
-        return num_frames
-    if elem_size is None:
-        elem_size = torch.finfo(torch.float32).bits // 8
-    frame_bytes = 1
-    for dim in frame_shape:
-        frame_bytes *= dim
-    frame_bytes *= elem_size
-    if num_frames * frame_bytes <= CHUNK_TARGET_BYTES:
-        return num_frames
-    return max(1, CHUNK_TARGET_BYTES // frame_bytes)
-
-def write_tensor_chunks(out, offset, tensor, batch_size, transform=None):
-    """Copy tensor rows into out[offset:] in chunks, optionally transforming each chunk."""
-    for start in range(0, tensor.shape[0], batch_size):
-        chunk = tensor[start:start + batch_size]
-        if transform is not None:
-            chunk = transform(chunk)
-        end = offset + chunk.shape[0]
-        out[offset:end] = chunk
-        offset = end
-    return offset
-
-def preallocated_cat(tensors, dim=0, batch_size=None, transform=None):
-    """Concatenate tensors along dim without holding all chunks in memory."""
-    if dim != 0:
-        raise NotImplementedError("preallocated_cat only supports dim=0")
-    total = sum(t.shape[0] for t in tensors)
-    if total == 0:
-        return tensors[0]
-    if batch_size is None or batch_size >= total:
-        if transform is None and len(tensors) == 1:
-            return tensors[0]
-        if transform is None:
-            return torch.cat(tensors, dim=0)
-    if batch_size is None:
-        batch_size = total
-    first = tensors[0][:1]
-    if transform is not None:
-        first = transform(first)
-    out = torch.empty((total, *first.shape[1:]), dtype=first.dtype, device=first.device)
-    del first
-    offset = 0
-    for tensor in tensors:
-        offset = write_tensor_chunks(out, offset, tensor, batch_size, transform)
-    return out
 
 def ffmpeg_suitability(path):
     try:

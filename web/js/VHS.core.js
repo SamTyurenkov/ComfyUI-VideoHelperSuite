@@ -2227,10 +2227,10 @@ app.registerExtension({
                             v = Math.round((v + Number.EPSILON) /
                                 this.options.round) * this.options.round
                         }
-                        if (this.options.max && v > this.options.max) {
+                        if (this.options.max != null && v > this.options.max) {
                             v = this.options.max
                         }
-                        if (this.options.min && v < this.options.max) {
+                        if (this.options.min != null && v < this.options.min) {
                             v = this.options.min
                         }
                         this.value = v

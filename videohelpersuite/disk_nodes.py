@@ -14,7 +14,7 @@ import folder_paths
 from comfy.utils import ProgressBar
 
 from .logger import logger
-from .utils import BIGMAX, ENCODE_ARGS, ffmpeg_path, hash_path, strip_path, validate_path
+from .utils import BIGMAX, ENCODE_ARGS, ffmpeg_path, floatOrInt, hash_path, strip_path, validate_path
 
 DISK_TYPE = "VHS_DISK_MEDIA"
 PREFERRED_ROOT = "/root/autodl-tmp"
@@ -418,7 +418,7 @@ class ImagesToDisk:
         return {
             "required": {
                 "images": ("IMAGE",),
-                "frame_rate": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 240.0, "step": 0.01}),
+                "frame_rate": (floatOrInt, {"default": 24, "min": 1, "step": 1}),
                 "base_dir": ("STRING", {"default": os.path.join(PREFERRED_ROOT, DISK_SUBDIR)}),
                 "encoder": (["auto", "h264_nvenc", "libx264"],),
                 "quality": ("INT", {"default": 12, "min": 0, "max": 51, "step": 1}),
