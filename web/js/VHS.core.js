@@ -1245,21 +1245,24 @@ function addPreviewOptions(nodeType) {
         options.unshift(...optNew);
     });
 }
-function addFormatWidgets(nodeType, nodeData) {
+function addFormatWidgets(nodeType, nodeData, widgetName="format") {
     chainCallback(nodeType.prototype, "onNodeCreated", function() {
         var formatWidget = null;
         var formatWidgetIndex = -1;
         for(let i = 0; i < this.widgets.length; i++) {
-            if (this.widgets[i].name === "format"){
+            if (this.widgets[i].name === widgetName){
                 formatWidget = this.widgets[i];
                 formatWidgetIndex = i+1;
                 break
             }
         }
+        if (!formatWidget) {
+            return
+        }
         let formatWidgetsCount = 0;
         chainCallback(formatWidget, "callback", (value) => {
             const formats = (LiteGraph.registered_node_types[this.type]
-                ?.nodeData?.input?.required?.format?.[1]?.formats)
+                ?.nodeData?.input?.required?.[widgetName]?.[1]?.formats)
             let newWidgets = [];
             if (formats?.[value]) {
                 let formatWidgets = formats[value]
@@ -1301,6 +1304,7 @@ function addFormatWidgets(nodeType, nodeData) {
             fitHeight(this);
             formatWidgetsCount = newWidgets.length;
         });
+        formatWidget.callback(formatWidget.value)
     });
 }
 function addLoadCommon(nodeType, nodeData) {
@@ -2054,7 +2058,7 @@ app.registerExtension({
                     this.updateParameters(params, true);
                 });
             });
-        } else if (nodeData?.name == "VHS_VideoCombine") {
+        } else if (nodeData?.name == "VHS_VideoCombine" || nodeData?.name == "VHS_DiskCombine") {
             addDateFormatting(nodeType, "filename_prefix");
             chainCallback(nodeType.prototype, "onExecuted", function(message) {
                 if (message?.gifs) {
@@ -2063,8 +2067,12 @@ app.registerExtension({
             });
             addVideoPreview(nodeType, false);
             addPreviewOptions(nodeType);
-            addFormatWidgets(nodeType, nodeData);
-            addVAEInputToggle(nodeType, nodeData)
+            if (nodeData?.name == "VHS_VideoCombine") {
+                addFormatWidgets(nodeType, nodeData);
+                addVAEInputToggle(nodeType, nodeData)
+            }
+        } else if (["VHS_ImagesToDisk", "VHS_MergeDisk", "VHS_AppendImagesToDisk"].includes(nodeData?.name)) {
+            addFormatWidgets(nodeType, nodeData, "encoder");
         } else if (nodeData?.name == "VHS_SaveImageSequence") {
             //Disabled for safety as VHS_SaveImageSequence is not currently merged
             //addDateFormating(nodeType, "directory_name", timestamp_widget=true);

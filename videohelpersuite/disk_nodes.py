@@ -131,11 +131,59 @@ def pick_encoder(encoder):
     return encoder
 
 
-def encoder_args(encoder, quality):
+def _truthy(value, default=True):
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.lower() not in ("false", "0", "")
+    return bool(value)
+
+
+def encoder_args(encoder, **kwargs):
     encoder = pick_encoder(encoder)
+    if "bitrate" in kwargs and kwargs.get("crf") is None:
+        bitrate = int(kwargs.get("bitrate", 50))
+        suffix = "M" if _truthy(kwargs.get("megabit", True)) else "K"
+        br = f"{bitrate}{suffix}"
+        if encoder == "h264_nvenc":
+            return [
+                "-c:v", "h264_nvenc", "-preset", "p4",
+                "-rc", "cbr", "-b:v", br, "-pix_fmt", "yuv420p",
+            ]
+        return [
+            "-c:v", "libx264", "-preset", "veryfast",
+            "-b:v", br, "-maxrate", br, "-bufsize", f"{bitrate * 2}{suffix}",
+            "-pix_fmt", "yuv420p",
+        ]
+    crf = int(kwargs.get("crf", kwargs.get("quality", 18)))
     if encoder == "h264_nvenc":
-        return ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", str(quality), "-pix_fmt", "yuv420p"]
-    return ["-c:v", "libx264", "-preset", "veryfast", "-crf", str(quality), "-pix_fmt", "yuv420p"]
+        return [
+            "-c:v", "h264_nvenc", "-preset", "p4",
+            "-rc", "constqp", "-qp", str(crf), "-cq", str(crf),
+            "-pix_fmt", "yuv420p",
+        ]
+    return ["-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf), "-pix_fmt", "yuv420p"]
+
+
+NVENC_RATE_WIDGETS = [
+    ["bitrate", "INT", {"default": 50, "min": 1, "max": 400, "step": 1}],
+    ["megabit", "BOOLEAN", {"default": True}],
+]
+X264_RATE_WIDGETS = [
+    ["crf", "INT", {"default": 18, "min": 0, "max": 51, "step": 1}],
+]
+
+
+def encoder_widgets():
+    return {
+        "encoder": (["auto", "h264_nvenc", "libx264"], {
+            "formats": {
+                "auto": NVENC_RATE_WIDGETS,
+                "h264_nvenc": NVENC_RATE_WIDGETS,
+                "libx264": X264_RATE_WIDGETS,
+            },
+        }),
+    }
 
 
 def run_ffmpeg(args, stdin=None):
@@ -264,7 +312,7 @@ def iter_rgb_bytes(images: Tensor, pbar=None):
             pbar.update(1)
 
 
-def encode_images_to_file(images, out_path, fps, encoder, quality, pbar=None):
+def encode_images_to_file(images, out_path, fps, encoder, pbar=None, **enc_kwargs):
     if images.ndim == 3:
         images = images.unsqueeze(0)
     height, width = int(images.shape[1]), int(images.shape[2])
@@ -276,7 +324,7 @@ def encode_images_to_file(images, out_path, fps, encoder, quality, pbar=None):
         _ffmpeg(), "-y", "-v", "error",
         "-f", "rawvideo", "-pix_fmt", "rgb24",
         "-s", f"{width}x{height}", "-r", str(fps), "-i", "-",
-    ] + vf + encoder_args(encoder, quality) + ["-an", out_path]
+    ] + vf + encoder_args(encoder, **enc_kwargs) + ["-an", out_path]
     proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     err_chunks = []
     drain = threading.Thread(target=lambda: err_chunks.append(proc.stderr.read()))
@@ -303,7 +351,7 @@ def encode_images_to_file(images, out_path, fps, encoder, quality, pbar=None):
     return media
 
 
-def concat_media(media_a, media_b, out_path, encoder, quality, merge_strategy="match A"):
+def concat_media(media_a, media_b, out_path, encoder, merge_strategy="match A", **enc_kwargs):
     a = require_media(media_a)
     b = require_media(media_b)
     same = (
@@ -347,7 +395,7 @@ def concat_media(media_a, media_b, out_path, encoder, quality, merge_strategy="m
         _ffmpeg(), "-y", "-v", "error",
         "-i", a["path"], "-i", b["path"],
         "-filter_complex", filter_complex, "-map", "[v]",
-    ] + encoder_args(encoder, quality) + ["-an", out_path])
+    ] + encoder_args(encoder, **enc_kwargs) + ["-an", out_path])
     return media_from_path(out_path, fps_hint=fps)
 
 
@@ -446,8 +494,7 @@ class ImagesToDisk:
                 "images": ("IMAGE",),
                 "frame_rate": (floatOrInt, {"default": 24, "min": 1, "step": 1}),
                 "base_dir": ("STRING", {"default": os.path.join(PREFERRED_ROOT, DISK_SUBDIR)}),
-                "encoder": (["auto", "h264_nvenc", "libx264"],),
-                "quality": ("INT", {"default": 12, "min": 0, "max": 51, "step": 1}),
+                **encoder_widgets(),
             },
             "hidden": {"unique_id": "UNIQUE_ID"},
         }
@@ -457,10 +504,12 @@ class ImagesToDisk:
     RETURN_NAMES = ("disk", "count")
     FUNCTION = "save"
 
-    def save(self, images, frame_rate, base_dir, encoder, quality, unique_id=None):
+    def save(self, images, frame_rate, base_dir, encoder, unique_id=None, **kwargs):
         out_path = new_clip_path(base_dir, unique_id, "images")
         pbar = ProgressBar(images.shape[0] if images.ndim == 4 else 1)
-        media = encode_images_to_file(images, out_path, frame_rate, encoder, quality, pbar)
+        media = encode_images_to_file(
+            images, out_path, frame_rate, encoder, pbar, **kwargs,
+        )
         return (media, media["count"])
 
 
@@ -503,8 +552,7 @@ class MergeDisk:
                 "disk_B": (DISK_TYPE,),
                 "merge_strategy": (["match A", "match B", "match smaller", "match larger"],),
                 "base_dir": ("STRING", {"default": os.path.join(PREFERRED_ROOT, DISK_SUBDIR)}),
-                "encoder": (["auto", "h264_nvenc", "libx264"],),
-                "quality": ("INT", {"default": 12, "min": 0, "max": 51, "step": 1}),
+                **encoder_widgets(),
             },
             "hidden": {"unique_id": "UNIQUE_ID"},
         }
@@ -514,9 +562,11 @@ class MergeDisk:
     RETURN_NAMES = ("disk", "count")
     FUNCTION = "merge"
 
-    def merge(self, disk_A, disk_B, merge_strategy, base_dir, encoder, quality, unique_id=None):
+    def merge(self, disk_A, disk_B, merge_strategy, base_dir, encoder, unique_id=None, **kwargs):
         out_path = new_clip_path(base_dir, unique_id, "merge")
-        media = concat_media(disk_A, disk_B, out_path, encoder, quality, merge_strategy)
+        media = concat_media(
+            disk_A, disk_B, out_path, encoder, merge_strategy, **kwargs,
+        )
         return (media, media["count"])
 
 
@@ -528,8 +578,7 @@ class AppendImagesToDisk:
                 "disk": (DISK_TYPE,),
                 "images": ("IMAGE",),
                 "base_dir": ("STRING", {"default": os.path.join(PREFERRED_ROOT, DISK_SUBDIR)}),
-                "encoder": (["auto", "h264_nvenc", "libx264"],),
-                "quality": ("INT", {"default": 12, "min": 0, "max": 51, "step": 1}),
+                **encoder_widgets(),
             },
             "hidden": {"unique_id": "UNIQUE_ID"},
         }
@@ -539,13 +588,17 @@ class AppendImagesToDisk:
     RETURN_NAMES = ("disk", "count")
     FUNCTION = "append"
 
-    def append(self, disk, images, base_dir, encoder, quality, unique_id=None):
+    def append(self, disk, images, base_dir, encoder, unique_id=None, **kwargs):
         media = require_media(disk)
         tail_path = new_clip_path(base_dir, unique_id, "append_tail")
         out_path = new_clip_path(base_dir, unique_id, "append")
         pbar = ProgressBar(images.shape[0] if images.ndim == 4 else 1)
-        tail = encode_images_to_file(images, tail_path, media["fps"], encoder, quality, pbar)
-        result = concat_media(media, tail, out_path, encoder, quality, "match A")
+        tail = encode_images_to_file(
+            images, tail_path, media["fps"], encoder, pbar, **kwargs,
+        )
+        result = concat_media(
+            media, tail, out_path, encoder, "match A", **kwargs,
+        )
         try:
             os.remove(tail_path)
         except OSError:
@@ -624,7 +677,7 @@ class DiskCombine:
             if save_output
             else folder_paths.get_temp_directory()
         )
-        full_output_folder, filename, _, _, _ = folder_paths.get_save_image_path(
+        full_output_folder, filename, _, subfolder, _ = folder_paths.get_save_image_path(
             filename_prefix, output_dir
         )
         counter = 1
@@ -654,7 +707,7 @@ class DiskCombine:
             "ui": {
                 "gifs": [{
                     "filename": os.path.basename(preview),
-                    "subfolder": "",
+                    "subfolder": subfolder,
                     "type": "output" if save_output else "temp",
                     "format": "video/mp4",
                     "frame_rate": media["fps"],
