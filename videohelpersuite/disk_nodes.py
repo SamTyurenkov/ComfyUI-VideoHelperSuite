@@ -387,11 +387,14 @@ def load_frame_window(media, start, count, pbar=None):
     except subprocess.CalledProcessError as e:
         err = e.stderr.decode(*ENCODE_ARGS) if e.stderr else str(e)
         raise Exception("ffmpeg decode failed:\n" + err)
-        if got != count:
-            logger.warn(f"Requested {count} disk frames, ffmpeg returned {got}")
+    raw = res.stdout
+    frame_bytes = height * width * 3
+    got = len(raw) // frame_bytes if frame_bytes else 0
+    if got != count:
+        logger.warn(f"Requested {count} disk frames, ffmpeg returned {got}")
     if got <= 0:
         raise Exception("ffmpeg returned no RGB frames")
-    arr = np.frombuffer(raw, dtype=np.uint8, count=got * height * width * 3)
+    arr = np.frombuffer(raw, dtype=np.uint8, count=got * frame_bytes)
     frames = arr.reshape((got, height, width, 3)).copy()
     if pbar is not None:
         pbar.update(got)
