@@ -295,7 +295,12 @@ def encode_images_to_file(images, out_path, fps, encoder, quality, pbar=None):
     stderr = b"".join(err_chunks)
     if rc != 0:
         raise Exception("ffmpeg encode failed:\n" + stderr.decode(*ENCODE_ARGS))
-    return media_from_path(out_path, fps_hint=fps)
+    media = media_from_path(out_path, fps_hint=fps)
+    media["count"] = int(images.shape[0])
+    media["width"], media["height"] = enc_w, enc_h
+    if media["fps"]:
+        media["duration"] = media["count"] / media["fps"]
+    return media
 
 
 def concat_media(media_a, media_b, out_path, encoder, quality, merge_strategy="match A"):
@@ -352,6 +357,15 @@ def _concat_entry(path):
     return f"file '{path}'\n"
 
 
+def _ffmpeg_raw(args):
+    try:
+        res = subprocess.run(args, capture_output=True, check=True)
+    except subprocess.CalledProcessError as e:
+        err = e.stderr.decode(*ENCODE_ARGS) if e.stderr else str(e)
+        raise Exception("ffmpeg decode failed:\n" + err)
+    return res.stdout
+
+
 def new_clip_path(base_dir, unique_id, prefix="clip"):
     root = resolve_disk_root(base_dir)
     safe_id = re.sub(r"[^A-Za-z0-9._-]", "_", str(unique_id or uuid.uuid4().hex[:8]))
@@ -373,23 +387,32 @@ def load_frame_window(media, start, count, pbar=None):
         raise Exception("Requested frame window is empty")
     fps = float(media["fps"]) or 24.0
     width, height = int(media["width"]), int(media["height"])
-    seek = ["-ss", f"{start / fps:.6f}"] if start > 0 else []
-    if start >= max(0, total - count - 1):
-        leftover = max(count / fps, 1.0 / max(fps, 1.0))
-        seek = ["-sseof", f"-{leftover:.6f}"]
-    args = [
-        _ffmpeg(), "-v", "error",
-        *seek, "-i", media["path"],
-        "-frames:v", str(count), "-an", "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
-    ]
-    try:
-        res = subprocess.run(args, capture_output=True, check=True)
-    except subprocess.CalledProcessError as e:
-        err = e.stderr.decode(*ENCODE_ARGS) if e.stderr else str(e)
-        raise Exception("ffmpeg decode failed:\n" + err)
-    raw = res.stdout
+    if width <= 0 or height <= 0:
+        raise Exception("Disk media has invalid size")
     frame_bytes = height * width * 3
-    got = len(raw) // frame_bytes if frame_bytes else 0
+    end = start + count - 1
+    raw = _ffmpeg_raw([
+        _ffmpeg(), "-v", "error", "-i", media["path"],
+        "-vf", f"select=between(n\\,{start}\\,{end})",
+        "-vsync", "0", "-frames:v", str(count),
+        "-an", "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
+    ])
+    got = len(raw) // frame_bytes
+    # One-frame -sseof at 1/fps seeks past EOF on NVENC clips; only use it as
+    # a last-N fallback with a couple of extra frames of padding.
+    if got <= 0:
+        extra = 8
+        leftover = max((count + extra) / fps, 0.25)
+        raw = _ffmpeg_raw([
+            _ffmpeg(), "-v", "error",
+            "-sseof", f"-{leftover:.6f}", "-i", media["path"],
+            "-vsync", "0", "-frames:v", str(count + extra),
+            "-an", "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
+        ])
+        got = len(raw) // frame_bytes
+    if got > count:
+        raw = raw[-(count * frame_bytes):]
+        got = count
     if got != count:
         logger.warn(f"Requested {count} disk frames, ffmpeg returned {got}")
     if got <= 0:
