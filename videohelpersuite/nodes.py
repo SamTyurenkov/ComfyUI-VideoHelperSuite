@@ -21,7 +21,8 @@ from .load_video_nodes import LoadVideoUpload, LoadVideoPath, LoadVideoFFmpegUpl
 from .load_images_nodes import LoadImagesFromDirectoryUpload, LoadImagesFromDirectoryPath
 from .batched_nodes import VAEEncodeBatched, VAEDecodeBatched
 from .disk_nodes import ImagesToDisk, PathToDisk, MergeDisk, AppendImagesToDisk, \
-        LoadDiskFrames, DiskInfo, DiskCombine, DiskInterpolate
+        LoadDiskFrames, DiskInfo, DiskCombine, DiskInterpolate, SplitDisk, ReverseDisk, \
+        DiskColorMatch, DiskRTXUpscale
 from .utils import ffmpeg_path, get_audio, hash_path, validate_path, requeue_workflow, \
         gifski_path, calculate_file_hash, strip_path, try_download_video, is_url, \
         imageOrLatent, BIGMAX, merge_filter_args, ENCODE_ARGS, floatOrInt, cached, \
@@ -1118,6 +1119,10 @@ NODE_CLASS_MAPPINGS = {
     "VHS_DiskInfo": DiskInfo,
     "VHS_DiskCombine": DiskCombine,
     "VHS_DiskInterpolate": DiskInterpolate,
+    "VHS_SplitDisk": SplitDisk,
+    "VHS_ReverseDisk": ReverseDisk,
+    "VHS_DiskColorMatch": DiskColorMatch,
+    "VHS_DiskRTXUpscale": DiskRTXUpscale,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "VHS_VideoCombine": "Video Combine 🎥🅥🅗🅢",
@@ -1164,10 +1169,14 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "VHS_SelectLatest": "Select Latest 🎥🅥🅗🅢",
     "VHS_ImagesToDisk": "Images to Disk 🎥🅥🅗🅢",
     "VHS_PathToDisk": "Path to Disk 🎥🅥🅗🅢",
-    "VHS_MergeDisk": "Merge Disk 🎥🅥🅗🅢",
+    "VHS_MergeDisk": "Disk Merge Images 🎥🅥🅗🅢",
     "VHS_AppendImagesToDisk": "Append Images to Disk 🎥🅥🅗🅢",
     "VHS_LoadDiskFrames": "Load Disk Frames 🎥🅥🅗🅢",
     "VHS_DiskInfo": "Disk Info 🎥🅥🅗🅢",
     "VHS_DiskCombine": "Disk Combine 🎥🅥🅗🅢",
     "VHS_DiskInterpolate": "Disk Interpolate 🎥🅥🅗🅢",
+    "VHS_SplitDisk": "Disk Split Images 🎥🅥🅗🅢",
+    "VHS_ReverseDisk": "Disk Reverse Batch 🎥🅥🅗🅢",
+    "VHS_DiskColorMatch": "Disk Color Match V2 🎥🅥🅗🅢",
+    "VHS_DiskRTXUpscale": "Disk RTX Upscale 🎥🅥🅗🅢",
 }

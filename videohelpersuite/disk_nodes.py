@@ -14,7 +14,7 @@ import folder_paths
 from comfy.utils import ProgressBar
 
 from .logger import logger
-from .utils import BIGMAX, ENCODE_ARGS, ffmpeg_path, floatOrInt, hash_path, strip_path, validate_path
+from .utils import BIGMAX, BIGMIN, ENCODE_ARGS, ffmpeg_path, floatOrInt, hash_path, strip_path, validate_path
 
 DISK_TYPE = "VHS_DISK_MEDIA"
 PREFERRED_ROOT = "/root/autodl-tmp"
@@ -1039,4 +1039,325 @@ class DiskInterpolate:
             media, ckpt_name, int(multiplier), out_path, encoder,
             keep_duration=keep_duration, pbar=pbar, **kwargs,
         )
+        return (result, result["count"])
+
+
+COLOR_MATCH_METHODS = [
+    "mkl", "hm", "reinhard", "mvgd", "hm-mvgd-hm", "hm-mkl-hm", "reinhard_lab_gpu",
+]
+
+
+def _reinhard_lab_gpu_frame(src_hwc, ref_hwc, strength, device):
+    import kornia
+    src = src_hwc.unsqueeze(0).to(device=device, dtype=torch.float32).movedim(-1, 1).contiguous()
+    ref = ref_hwc.unsqueeze(0).to(device=device, dtype=torch.float32).movedim(-1, 1).contiguous()
+    src_lab = kornia.color.rgb_to_lab(src)
+    ref_lab = kornia.color.rgb_to_lab(ref)
+    src_flat = src_lab.view(1, 3, -1)
+    ref_flat = ref_lab.view(1, 3, -1)
+    src_std, src_mean = torch.std_mean(src_flat, dim=-1, keepdim=True, unbiased=False)
+    ref_std, ref_mean = torch.std_mean(ref_flat, dim=-1, keepdim=True, unbiased=False)
+    src_std = src_std.clamp_min_(1e-6)
+    corrected = (src_flat - src_mean) * (ref_std / src_std) + ref_mean
+    corrected = kornia.color.lab_to_rgb(corrected.view_as(src_lab))
+    out = (1.0 - strength) * src + strength * corrected
+    return out[0].movedim(0, -1).contiguous().cpu().clamp_(0, 1)
+
+
+def _color_matcher_frame(src_hwc, ref_hwc, method, strength):
+    from color_matcher import ColorMatcher
+    src_np = src_hwc.detach().cpu().numpy()
+    ref_np = ref_hwc.detach().cpu().numpy()
+    try:
+        result = ColorMatcher().transfer(src=src_np, ref=ref_np, method=method)
+        if strength != 1:
+            result = src_np + strength * (result - src_np)
+        return torch.from_numpy(result).to(dtype=torch.float32).clamp_(0, 1)
+    except Exception as e:
+        logger.warn(f"Color match failed, keeping original frame: {e}")
+        return src_hwc.detach().cpu().clamp(0, 1)
+
+
+class SplitDisk:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "disk": (DISK_TYPE,),
+                "split_index": ("INT", {"default": 0, "step": 1, "min": BIGMIN, "max": BIGMAX}),
+                "base_dir": ("STRING", {"default": os.path.join(PREFERRED_ROOT, DISK_SUBDIR)}),
+                **encoder_widgets(),
+            },
+            "hidden": {"unique_id": "UNIQUE_ID"},
+        }
+
+    CATEGORY = "Video Helper Suite 🎥🅥🅗🅢/disk"
+    RETURN_TYPES = (DISK_TYPE, "INT", DISK_TYPE, "INT")
+    RETURN_NAMES = ("disk_A", "A_count", "disk_B", "B_count")
+    FUNCTION = "split"
+
+    def split(self, disk, split_index, base_dir, encoder, unique_id=None, **kwargs):
+        media = require_media(disk)
+        total = int(media["count"])
+        idx = int(split_index)
+        if idx < 0:
+            idx = total + idx
+        idx = max(0, min(idx, total))
+        if idx <= 0 or idx >= total:
+            raise Exception("split_index must leave frames on both sides")
+        path_a = new_clip_path(base_dir, unique_id, "split_a")
+        path_b = new_clip_path(base_dir, unique_id, "split_b")
+        writer_a = _FfmpegFrameWriter(path_a, media["width"], media["height"], media["fps"], encoder, **kwargs)
+        writer_b = _FfmpegFrameWriter(path_b, media["width"], media["height"], media["fps"], encoder, **kwargs)
+        pbar = ProgressBar(total)
+        i = 0
+        try:
+            for frame in _iter_disk_hwc(media):
+                if i < idx:
+                    writer_a.write_hwc(frame)
+                else:
+                    writer_b.write_hwc(frame)
+                i += 1
+                pbar.update(1)
+            a = writer_a.close()
+            b = writer_b.close()
+        except Exception:
+            try:
+                writer_a.proc.kill()
+                writer_b.proc.kill()
+            except Exception:
+                pass
+            raise
+        return (a, a["count"], b, b["count"])
+
+
+class ReverseDisk:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "disk": (DISK_TYPE,),
+                "base_dir": ("STRING", {"default": os.path.join(PREFERRED_ROOT, DISK_SUBDIR)}),
+                **encoder_widgets(),
+            },
+            "hidden": {"unique_id": "UNIQUE_ID"},
+        }
+
+    CATEGORY = "Video Helper Suite 🎥🅥🅗🅢/disk"
+    RETURN_TYPES = (DISK_TYPE, "INT")
+    RETURN_NAMES = ("disk", "count")
+    FUNCTION = "reverse"
+
+    def reverse(self, disk, base_dir, encoder, unique_id=None, **kwargs):
+        media = require_media(disk)
+        width, height = int(media["width"]), int(media["height"])
+        fps = float(media["fps"]) or 24.0
+        frame_bytes = height * width * 3
+        out_path = new_clip_path(base_dir, unique_id, "reverse")
+        raw_path = out_path + ".raw"
+        args = [
+            _ffmpeg(), "-v", "error", "-i", media["path"],
+            "-vsync", "0", "-an", "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
+        ]
+        proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=frame_bytes)
+        err_chunks = []
+        drain = threading.Thread(target=lambda: err_chunks.append(proc.stderr.read()))
+        drain.start()
+        n = 0
+        try:
+            with open(raw_path, "wb") as raw:
+                while True:
+                    chunk = proc.stdout.read(frame_bytes)
+                    if not chunk or len(chunk) < frame_bytes:
+                        break
+                    raw.write(chunk)
+                    n += 1
+            rc = proc.wait()
+            drain.join()
+            if rc != 0:
+                err = b"".join(err_chunks).decode(*ENCODE_ARGS)
+                if err.strip():
+                    raise Exception("ffmpeg decode failed:\n" + err)
+            if n <= 0:
+                raise Exception("ffmpeg returned no RGB frames")
+            writer = _FfmpegFrameWriter(out_path, width, height, fps, encoder, **kwargs)
+            pbar = ProgressBar(n)
+            try:
+                with open(raw_path, "rb") as raw:
+                    for i in range(n - 1, -1, -1):
+                        raw.seek(i * frame_bytes)
+                        writer.write_bytes(raw.read(frame_bytes))
+                        pbar.update(1)
+                return (writer.close(), n)
+            except Exception:
+                try:
+                    writer.proc.kill()
+                    writer.proc.wait()
+                except Exception:
+                    pass
+                raise
+        finally:
+            try:
+                os.remove(raw_path)
+            except OSError:
+                pass
+
+
+class DiskColorMatch:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "disk": (DISK_TYPE,),
+                "method": (COLOR_MATCH_METHODS, {"default": "mkl"}),
+                "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01}),
+                "base_dir": ("STRING", {"default": os.path.join(PREFERRED_ROOT, DISK_SUBDIR)}),
+                **encoder_widgets(),
+            },
+            "optional": {
+                "image_ref": ("IMAGE",),
+                "disk_ref": (DISK_TYPE,),
+            },
+            "hidden": {"unique_id": "UNIQUE_ID"},
+        }
+
+    CATEGORY = "Video Helper Suite 🎥🅥🅗🅢/disk"
+    RETURN_TYPES = (DISK_TYPE, "INT")
+    RETURN_NAMES = ("disk", "count")
+    FUNCTION = "match"
+
+    def match(self, disk, method, strength, base_dir, encoder, unique_id=None, image_ref=None, disk_ref=None, **kwargs):
+        media = require_media(disk)
+        if image_ref is None and disk_ref is None:
+            raise Exception("Provide image_ref or disk_ref")
+        if float(strength) == 0:
+            out_path = new_clip_path(base_dir, unique_id, "cm")
+            run_ffmpeg([_ffmpeg(), "-y", "-v", "error", "-i", media["path"], "-c", "copy", "-an", out_path])
+            copied = media_from_path(out_path, fps_hint=media["fps"])
+            copied["count"] = media["count"]
+            return (copied, copied["count"])
+
+        ref_iter = None
+        ref_fixed = None
+        if disk_ref is not None:
+            ref_media = require_media(disk_ref)
+            if int(ref_media["count"]) <= 1:
+                ref_fixed = next(_iter_disk_hwc(ref_media))
+            else:
+                ref_iter = _iter_disk_hwc(ref_media)
+        else:
+            if image_ref.ndim == 3:
+                image_ref = image_ref.unsqueeze(0)
+            if image_ref.shape[0] == 1:
+                ref_fixed = image_ref[0]
+            else:
+                refs = image_ref
+
+        device = None
+        if method == "reinhard_lab_gpu":
+            from comfy import model_management
+            device = model_management.get_torch_device()
+
+        out_path = new_clip_path(base_dir, unique_id, "cm")
+        writer = _FfmpegFrameWriter(out_path, media["width"], media["height"], media["fps"], encoder, **kwargs)
+        pbar = ProgressBar(max(int(media["count"]), 1))
+        i = 0
+        try:
+            for frame in _iter_disk_hwc(media):
+                if ref_fixed is not None:
+                    ref = ref_fixed
+                elif ref_iter is not None:
+                    try:
+                        ref = next(ref_iter)
+                    except StopIteration:
+                        raise Exception("disk_ref ran out of frames before the target clip ended")
+                else:
+                    ref = refs[min(i, refs.shape[0] - 1)]
+                if method == "reinhard_lab_gpu":
+                    out = _reinhard_lab_gpu_frame(frame, ref, float(strength), device)
+                else:
+                    out = _color_matcher_frame(frame, ref, method, float(strength))
+                writer.write_hwc(out)
+                i += 1
+                pbar.update(1)
+            result = writer.close()
+        except Exception:
+            try:
+                writer.proc.kill()
+                writer.proc.wait()
+            except Exception:
+                pass
+            raise
+        return (result, result["count"])
+
+
+class DiskRTXUpscale:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "disk": (DISK_TYPE,),
+                "scale": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 4.0, "step": 0.01}),
+                "width": ("INT", {"default": 0, "min": 0, "max": 8192, "step": 8}),
+                "height": ("INT", {"default": 0, "min": 0, "max": 8192, "step": 8}),
+                "quality": (["LOW", "MEDIUM", "HIGH", "ULTRA"], {"default": "ULTRA"}),
+                "base_dir": ("STRING", {"default": os.path.join(PREFERRED_ROOT, DISK_SUBDIR)}),
+                **encoder_widgets(),
+            },
+            "hidden": {"unique_id": "UNIQUE_ID"},
+        }
+
+    CATEGORY = "Video Helper Suite 🎥🅥🅗🅢/disk"
+    RETURN_TYPES = (DISK_TYPE, "INT")
+    RETURN_NAMES = ("disk", "count")
+    FUNCTION = "upscale"
+
+    def upscale(self, disk, scale, width, height, quality, base_dir, encoder, unique_id=None, **kwargs):
+        try:
+            import nvvfx
+        except ImportError as e:
+            raise Exception("nvidia-vfx is required for Disk RTX Upscale") from e
+        media = require_media(disk)
+        src_w, src_h = int(media["width"]), int(media["height"])
+        if int(width) > 0 and int(height) > 0:
+            out_w, out_h = int(width), int(height)
+        else:
+            out_w = int(src_w * float(scale))
+            out_h = int(src_h * float(scale))
+        out_w = max(8, round(out_w / 8) * 8)
+        out_h = max(8, round(out_h / 8) * 8)
+        quality_mapping = {
+            "LOW": nvvfx.effects.QualityLevel.LOW,
+            "MEDIUM": nvvfx.effects.QualityLevel.MEDIUM,
+            "HIGH": nvvfx.effects.QualityLevel.HIGH,
+            "ULTRA": nvvfx.effects.QualityLevel.ULTRA,
+        }
+        selected = quality_mapping.get(quality, nvvfx.effects.QualityLevel.HIGH)
+        out_path = new_clip_path(base_dir, unique_id, "vsr")
+        writer = None
+        pbar = ProgressBar(max(int(media["count"]), 1))
+        try:
+            with nvvfx.VideoSuperRes(selected) as sr:
+                sr.output_width = out_w
+                sr.output_height = out_h
+                sr.load()
+                writer = _FfmpegFrameWriter(out_path, out_w, out_h, media["fps"], encoder, **kwargs)
+                for frame in _iter_disk_hwc(media):
+                    inp = frame.movedim(-1, 0).float().contiguous().cuda()
+                    # nvvfx capsule aliases C++ memory — clone before the next run()
+                    up = torch.from_dlpack(sr.run(inp).image).clone()
+                    writer.write_hwc(up.movedim(0, -1).float().clamp(0, 1))
+                    del inp, up
+                    pbar.update(1)
+            if writer is None:
+                raise Exception("RTX VSR failed before encoding started")
+            result = writer.close()
+        except Exception:
+            if writer is not None:
+                try:
+                    writer.proc.kill()
+                    writer.proc.wait()
+                except Exception:
+                    pass
+            raise
         return (result, result["count"])

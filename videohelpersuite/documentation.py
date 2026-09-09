@@ -680,6 +680,35 @@ descriptions = {
          'keep_duration': 'If true, fps is multiplied so duration stays the same',
         },
     }],
+  "VHS_SplitDisk": ['Disk Split Images 🎥🅥🅗🅢', short_desc('Split a disk clip at split_index without loading IMAGE into RAM'),
+    {'Inputs': {'disk': 'VHS_DISK_MEDIA handle'},
+     'Outputs': {'disk_A': 'Frames before split_index', 'disk_B': 'Frames from split_index'},
+     'Widgets': {'split_index': 'First frame of B. Negative counts from the end'},
+    }],
+  "VHS_ReverseDisk": ['Disk Reverse Batch 🎥🅥🅗🅢', short_desc('Reverse frame order of a disk clip'),
+    'Writes a raw dump then re-encodes last-to-first so ffmpeg reverse does not hold the whole clip in RAM.',
+    {'Inputs': {'disk': 'VHS_DISK_MEDIA handle'},
+     'Outputs': {'disk': 'Reversed clip'},
+    }],
+  "VHS_DiskColorMatch": ['Disk Color Match V2 🎥🅥🅗🅢', short_desc('KJNodes ColorMatchV2 over a disk clip, one frame at a time'),
+    {'Inputs': {
+        'disk': 'Target clip',
+        'image_ref': 'Reference IMAGE, usually 1 frame',
+        'disk_ref': 'Optional per-frame reference clip',
+        },
+     'Widgets': {
+         'method': 'Same methods as ColorMatchV2 including reinhard_lab_gpu',
+         'strength': '0 keeps the original clip',
+        },
+    }],
+  "VHS_DiskRTXUpscale": ['Disk RTX Upscale 🎥🅥🅗🅢', short_desc('NVIDIA RTX Video Super Resolution, one frame at a time, output stays on disk'),
+    'width/height 0 means use scale. Quality ULTRA matches the original RTX node.',
+    {'Inputs': {'disk': 'VHS_DISK_MEDIA handle'},
+     'Widgets': {
+         'scale': 'Multiplier when width and height are 0',
+         'quality': 'LOW MEDIUM HIGH ULTRA',
+        },
+    }],
 }
 
 def as_html(entry, depth=0):
