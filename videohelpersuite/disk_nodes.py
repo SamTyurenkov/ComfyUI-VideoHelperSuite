@@ -870,16 +870,20 @@ class _FfmpegFrameWriter:
         return media
 
 
-def _iter_disk_hwc(media):
+def _iter_disk_hwc(media, every=1):
     media = require_media(media)
     width, height = int(media["width"]), int(media["height"])
     frame_bytes = height * width * 3
     if frame_bytes <= 0:
         raise Exception("Disk media has invalid size")
+    every = max(int(every), 1)
     args = [
         _ffmpeg(), "-v", "error", "-i", media["path"],
-        "-vsync", "0", "-an", "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
+        "-vsync", "0", "-an",
     ]
+    if every > 1:
+        args += ["-vf", f"select=not(mod(n\\,{every}))"]
+    args += ["-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
     proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=frame_bytes)
     err_chunks = []
     drain = threading.Thread(target=lambda: err_chunks.append(proc.stderr.read()))
@@ -904,6 +908,13 @@ def _iter_disk_hwc(media):
         proc.wait()
         drain.join()
         raise
+    finally:
+        if proc.poll() is None:
+            try:
+                proc.kill()
+                proc.wait()
+            except Exception:
+                pass
 
 
 def interpolate_disk_clip(media, ckpt_name, multiplier, out_path, encoder, keep_duration=True, pbar=None, **enc_kwargs):
@@ -1042,40 +1053,151 @@ class DiskInterpolate:
         return (result, result["count"])
 
 
-COLOR_MATCH_METHODS = [
-    "mkl", "hm", "reinhard", "mvgd", "hm-mvgd-hm", "hm-mkl-hm", "reinhard_lab_gpu",
-]
+COLOR_MATCH_METHODS = ["reinhard_lab", "reinhard_rgb", "mkl_rgb"]
+_STATS_MAX_SIDE = 128
 
 
-def _reinhard_lab_gpu_frame(src_hwc, ref_hwc, strength, device):
+class _ChannelMoments:
+    def __init__(self):
+        self.n = 0
+        self.sum = None
+        self.outer = None
+
+    def add_hwc(self, hwc):
+        pix = hwc.reshape(-1, 3).detach().float().cpu()
+        if pix.numel() == 0:
+            return
+        if self.sum is None:
+            self.sum = torch.zeros(3, dtype=torch.float64)
+            self.outer = torch.zeros(3, 3, dtype=torch.float64)
+        pix64 = pix.to(dtype=torch.float64)
+        self.n += pix64.shape[0]
+        self.sum += pix64.sum(0)
+        self.outer += pix64.T @ pix64
+
+    def mean(self):
+        if self.n <= 0:
+            raise Exception("No pixels gathered for color stats")
+        return (self.sum / self.n).float()
+
+    def cov(self):
+        mean = self.sum / self.n
+        cov = self.outer / self.n - torch.outer(mean, mean)
+        return cov.float()
+
+    def std(self):
+        return self.cov().diag().clamp_min(1e-8).sqrt()
+
+
+def _downsample_hwc(hwc, max_side=_STATS_MAX_SIDE):
+    h, w = int(hwc.shape[0]), int(hwc.shape[1])
+    m = max(h, w)
+    if m <= max_side:
+        return hwc.float()
+    scale = max_side / m
+    nh, nw = max(1, int(h * scale)), max(1, int(w * scale))
+    x = hwc.float().movedim(-1, 0).unsqueeze(0)
+    x = torch.nn.functional.interpolate(x, size=(nh, nw), mode="area")
+    return x[0].movedim(0, -1).contiguous()
+
+
+def _rgb_to_lab_hwc(hwc, device=None):
     import kornia
-    src = src_hwc.unsqueeze(0).to(device=device, dtype=torch.float32).movedim(-1, 1).contiguous()
-    ref = ref_hwc.unsqueeze(0).to(device=device, dtype=torch.float32).movedim(-1, 1).contiguous()
-    src_lab = kornia.color.rgb_to_lab(src)
-    ref_lab = kornia.color.rgb_to_lab(ref)
-    src_flat = src_lab.view(1, 3, -1)
-    ref_flat = ref_lab.view(1, 3, -1)
-    src_std, src_mean = torch.std_mean(src_flat, dim=-1, keepdim=True, unbiased=False)
-    ref_std, ref_mean = torch.std_mean(ref_flat, dim=-1, keepdim=True, unbiased=False)
-    src_std = src_std.clamp_min_(1e-6)
-    corrected = (src_flat - src_mean) * (ref_std / src_std) + ref_mean
-    corrected = kornia.color.lab_to_rgb(corrected.view_as(src_lab))
-    out = (1.0 - strength) * src + strength * corrected
-    return out[0].movedim(0, -1).contiguous().cpu().clamp_(0, 1)
+    x = hwc.float()
+    if device is not None:
+        x = x.to(device=device)
+    nchw = x.unsqueeze(0).movedim(-1, 1).contiguous()
+    lab = kornia.color.rgb_to_lab(nchw)
+    return lab[0].movedim(0, -1).contiguous()
 
 
-def _color_matcher_frame(src_hwc, ref_hwc, method, strength):
-    from color_matcher import ColorMatcher
-    src_np = src_hwc.detach().cpu().numpy()
-    ref_np = ref_hwc.detach().cpu().numpy()
-    try:
-        result = ColorMatcher().transfer(src=src_np, ref=ref_np, method=method)
-        if strength != 1:
-            result = src_np + strength * (result - src_np)
-        return torch.from_numpy(result).to(dtype=torch.float32).clamp_(0, 1)
-    except Exception as e:
-        logger.warn(f"Color match failed, keeping original frame: {e}")
-        return src_hwc.detach().cpu().clamp(0, 1)
+def _lab_to_rgb_nchw(lab_nchw):
+    import kornia
+    return kornia.color.lab_to_rgb(lab_nchw).clamp(0, 1)
+
+
+def _mkl_matrix(cov_src, cov_ref):
+    def _sqrtm(c):
+        w, v = torch.linalg.eigh(c)
+        w = w.clamp_min(1e-8)
+        return v @ torch.diag(w.sqrt()) @ v.T
+
+    def _invsqrtm(c):
+        w, v = torch.linalg.eigh(c)
+        w = w.clamp_min(1e-8)
+        return v @ torch.diag(w.rsqrt()) @ v.T
+
+    eye = torch.eye(3, dtype=torch.float32, device=cov_src.device)
+    cs = cov_src.float() + eye * 1e-6
+    ct = cov_ref.float() + eye * 1e-6
+    cs_h = _sqrtm(cs)
+    return _invsqrtm(cs) @ _sqrtm(cs_h @ ct @ cs_h) @ _invsqrtm(cs)
+
+
+def _prep_stats_frame(hwc, method):
+    small = _downsample_hwc(hwc)
+    if method == "reinhard_lab":
+        return _rgb_to_lab_hwc(small, device="cpu")
+    return small.cpu()
+
+
+def _collect_clip_moments(media, source_stats, sample_every, method):
+    moments = _ChannelMoments()
+    if source_stats == "first":
+        frame = next(_iter_disk_hwc(media), None)
+        if frame is None:
+            raise Exception("Source clip has no frames")
+        moments.add_hwc(_prep_stats_frame(frame, method))
+        return moments
+    every = 1 if source_stats == "full" else max(int(sample_every), 1)
+    n = 0
+    for frame in _iter_disk_hwc(media, every=every):
+        moments.add_hwc(_prep_stats_frame(frame, method))
+        n += 1
+    if n <= 0:
+        raise Exception("Source clip has no frames")
+    return moments
+
+
+def _collect_image_moments(image, method):
+    moments = _ChannelMoments()
+    if image.ndim == 3:
+        image = image.unsqueeze(0)
+    for i in range(image.shape[0]):
+        moments.add_hwc(_prep_stats_frame(image[i], method))
+    return moments
+
+
+def _apply_locked_grade(frame, method, src_mean, src_std, ref_mean, ref_std, matrix, strength, chroma_only, device):
+    src = frame.unsqueeze(0).to(device=device, dtype=torch.float32).movedim(-1, 1).contiguous()
+    s = float(strength)
+    if method == "reinhard_lab":
+        import kornia
+        lab = kornia.color.rgb_to_lab(src)
+        mean = src_mean.to(device=device).view(1, 3, 1, 1)
+        scale = (ref_std / src_std.clamp_min(1e-6)).to(device=device).view(1, 3, 1, 1)
+        shift = ref_mean.to(device=device).view(1, 3, 1, 1)
+        graded = (lab - mean) * scale + shift
+        if chroma_only:
+            graded = torch.cat([lab[:, :1], graded[:, 1:]], dim=1)
+        corrected = _lab_to_rgb_nchw(graded)
+    elif method == "reinhard_rgb":
+        mean = src_mean.to(device=device).view(1, 3, 1, 1)
+        scale = (ref_std / src_std.clamp_min(1e-6)).to(device=device).view(1, 3, 1, 1)
+        shift = ref_mean.to(device=device).view(1, 3, 1, 1)
+        corrected = ((src - mean) * scale + shift).clamp(0, 1)
+    else:
+        pix = src.movedim(1, -1).reshape(-1, 3)
+        A = matrix.to(device=device, dtype=torch.float32)
+        graded = (pix - src_mean.to(device=device)) @ A.T + ref_mean.to(device=device)
+        corrected = graded.view(1, src.shape[2], src.shape[3], 3).movedim(-1, 1).clamp(0, 1)
+        if chroma_only:
+            import kornia
+            src_lab = kornia.color.rgb_to_lab(src)
+            out_lab = kornia.color.rgb_to_lab(corrected)
+            corrected = _lab_to_rgb_nchw(torch.cat([src_lab[:, :1], out_lab[:, 1:]], dim=1))
+    mixed = (1.0 - s) * src + s * corrected
+    return mixed[0].movedim(0, -1).contiguous().cpu().clamp_(0, 1)
 
 
 class SplitDisk:
@@ -1209,7 +1331,10 @@ class DiskColorMatch:
         return {
             "required": {
                 "disk": (DISK_TYPE,),
-                "method": (COLOR_MATCH_METHODS, {"default": "mkl"}),
+                "method": (COLOR_MATCH_METHODS, {"default": "reinhard_lab"}),
+                "source_stats": (["sampled", "first", "full"], {"default": "sampled"}),
+                "sample_every": ("INT", {"default": 8, "min": 1, "max": 256, "step": 1}),
+                "chroma_only": ("BOOLEAN", {"default": True}),
                 "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01}),
                 "base_dir": ("STRING", {"default": os.path.join(PREFERRED_ROOT, DISK_SUBDIR)}),
                 **encoder_widgets(),
@@ -1226,10 +1351,11 @@ class DiskColorMatch:
     RETURN_NAMES = ("disk", "count")
     FUNCTION = "match"
 
-    def match(self, disk, method, strength, base_dir, encoder, unique_id=None, image_ref=None, disk_ref=None, **kwargs):
+    def match(self, disk, method, source_stats, sample_every, chroma_only, strength, base_dir, encoder,
+              unique_id=None, image_ref=None, disk_ref=None, **kwargs):
         media = require_media(disk)
         if image_ref is None and disk_ref is None:
-            raise Exception("Provide image_ref or disk_ref")
+            raise Exception("Provide image_ref or disk_ref — the look to match, not a per-frame pair")
         if float(strength) == 0:
             out_path = new_clip_path(base_dir, unique_id, "cm")
             run_ffmpeg([_ffmpeg(), "-y", "-v", "error", "-i", media["path"], "-c", "copy", "-an", out_path])
@@ -1237,48 +1363,31 @@ class DiskColorMatch:
             copied["count"] = media["count"]
             return (copied, copied["count"])
 
-        ref_iter = None
-        ref_fixed = None
+        src_m = _collect_clip_moments(media, source_stats, sample_every, method)
         if disk_ref is not None:
             ref_media = require_media(disk_ref)
-            if int(ref_media["count"]) <= 1:
-                ref_fixed = next(_iter_disk_hwc(ref_media))
-            else:
-                ref_iter = _iter_disk_hwc(ref_media)
+            ref_sample = "full" if source_stats == "full" else "sampled"
+            ref_m = _collect_clip_moments(ref_media, ref_sample, sample_every, method)
         else:
-            if image_ref.ndim == 3:
-                image_ref = image_ref.unsqueeze(0)
-            if image_ref.shape[0] == 1:
-                ref_fixed = image_ref[0]
-            else:
-                refs = image_ref
+            ref_m = _collect_image_moments(image_ref, method)
 
-        device = None
-        if method == "reinhard_lab_gpu":
-            from comfy import model_management
-            device = model_management.get_torch_device()
+        src_mean, src_std = src_m.mean(), src_m.std()
+        ref_mean, ref_std = ref_m.mean(), ref_m.std()
+        matrix = _mkl_matrix(src_m.cov(), ref_m.cov()) if method == "mkl_rgb" else None
+
+        from comfy import model_management
+        device = model_management.get_torch_device()
 
         out_path = new_clip_path(base_dir, unique_id, "cm")
         writer = _FfmpegFrameWriter(out_path, media["width"], media["height"], media["fps"], encoder, **kwargs)
         pbar = ProgressBar(max(int(media["count"]), 1))
-        i = 0
         try:
             for frame in _iter_disk_hwc(media):
-                if ref_fixed is not None:
-                    ref = ref_fixed
-                elif ref_iter is not None:
-                    try:
-                        ref = next(ref_iter)
-                    except StopIteration:
-                        raise Exception("disk_ref ran out of frames before the target clip ended")
-                else:
-                    ref = refs[min(i, refs.shape[0] - 1)]
-                if method == "reinhard_lab_gpu":
-                    out = _reinhard_lab_gpu_frame(frame, ref, float(strength), device)
-                else:
-                    out = _color_matcher_frame(frame, ref, method, float(strength))
+                out = _apply_locked_grade(
+                    frame, method, src_mean, src_std, ref_mean, ref_std, matrix,
+                    float(strength), bool(chroma_only), device,
+                )
                 writer.write_hwc(out)
-                i += 1
                 pbar.update(1)
             result = writer.close()
         except Exception:

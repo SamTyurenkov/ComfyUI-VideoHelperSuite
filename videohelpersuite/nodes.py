@@ -1177,6 +1177,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "VHS_DiskInterpolate": "Disk Interpolate 🎥🅥🅗🅢",
     "VHS_SplitDisk": "Disk Split Images 🎥🅥🅗🅢",
     "VHS_ReverseDisk": "Disk Reverse Batch 🎥🅥🅗🅢",
-    "VHS_DiskColorMatch": "Disk Color Match V2 🎥🅥🅗🅢",
+    "VHS_DiskColorMatch": "Disk Color Match 🎥🅥🅗🅢",
     "VHS_DiskRTXUpscale": "Disk RTX Upscale 🎥🅥🅗🅢",
 }
