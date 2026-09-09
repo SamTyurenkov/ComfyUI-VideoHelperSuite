@@ -716,3 +716,327 @@ class DiskCombine:
             },
             "result": ((save_output, output_files),),
         }
+
+
+KNOWN_INTERP_CKPTS = [
+    "rife_v4.25_heavy.safetensors",
+    "film_net_fp16.safetensors",
+]
+
+
+def _interp_ckpt_names():
+    try:
+        if hasattr(folder_paths, "add_model_folder_path"):
+            folder_paths.add_model_folder_path(
+                "frame_interpolation",
+                os.path.join(folder_paths.models_dir, "frame_interpolation"),
+            )
+    except Exception:
+        pass
+    names = []
+    try:
+        names = list(folder_paths.get_filename_list("frame_interpolation"))
+    except Exception:
+        names = []
+    seen = set()
+    ordered = []
+    for name in KNOWN_INTERP_CKPTS + names:
+        if name in seen:
+            continue
+        seen.add(name)
+        ordered.append(name)
+    return ordered
+
+
+_interp_patchers = {}
+
+
+def _load_interp_patcher(model_name):
+    import comfy.model_patcher
+    import comfy.utils as comfy_utils
+    from comfy import model_management
+    from comfy_extras.frame_interpolation_models.ifnet import IFNet, detect_rife_config
+
+    getter = getattr(folder_paths, "get_full_path_or_raise", None)
+    if getter is not None:
+        model_path = getter("frame_interpolation", model_name)
+    else:
+        model_path = folder_paths.get_full_path("frame_interpolation", model_name)
+        if not model_path:
+            raise Exception(f"Frame interpolation model not found: {model_name}")
+    cached = _interp_patchers.get(model_path)
+    if cached is not None:
+        return cached
+
+    sd = comfy_utils.load_torch_file(model_path, safe_load=True)
+    is_film = (
+        "extract.extract_sublevels.convs.0.0.conv.weight" in sd
+        or "film" in model_name.lower()
+    )
+    if is_film:
+        from comfy_extras.frame_interpolation_models.film_net import FILMNet
+        model = FILMNet()
+        model.load_state_dict(sd)
+    else:
+        sd = comfy_utils.state_dict_prefix_replace(sd, {"module.": "", "flownet.": ""})
+        key_map = {}
+        for k in sd:
+            for i in range(5):
+                if k.startswith(f"block{i}."):
+                    key_map[k] = f"blocks.{i}.{k[len(f'block{i}.'):]}"
+        if key_map:
+            sd = {key_map.get(k, k): v for k, v in sd.items()}
+        sd = {k: v for k, v in sd.items() if not k.startswith(("teacher.", "caltime."))}
+        try:
+            head_ch, channels = detect_rife_config(sd)
+        except (KeyError, ValueError) as e:
+            raise Exception(f"Unrecognized frame interpolation model: {model_name}") from e
+        model = IFNet(head_ch=head_ch, channels=channels)
+        model.load_state_dict(sd)
+
+    dtype = torch.float16 if model_management.should_use_fp16(model_management.get_torch_device()) else torch.float32
+    model.eval().to(dtype)
+    Patcher = getattr(comfy.model_patcher, "CoreModelPatcher", comfy.model_patcher.ModelPatcher)
+    patcher = Patcher(
+        model,
+        load_device=model_management.get_torch_device(),
+        offload_device=model_management.unet_offload_device(),
+    )
+    _interp_patchers[model_path] = patcher
+    return patcher
+
+
+def _hwc_to_rgb_bytes(frame):
+    if frame.device.type != "cpu":
+        frame = frame.cpu()
+    arr = np.clip(frame.numpy() * 255.0 + 0.5, 0, 255).astype(np.uint8)
+    if arr.shape[-1] == 4:
+        arr = arr[..., :3]
+    return arr.tobytes()
+
+
+class _FfmpegFrameWriter:
+    def __init__(self, out_path, width, height, fps, encoder, **enc_kwargs):
+        self.width, self.height = int(width), int(height)
+        self.fps = float(fps)
+        self.written = 0
+        self.out_path = out_path
+        enc_w, enc_h = even_size(self.width, self.height)
+        self.enc_w, self.enc_h = enc_w, enc_h
+        vf = []
+        if (enc_w, enc_h) != (self.width, self.height):
+            vf = ["-vf", f"pad={enc_w}:{enc_h}:(ow-iw)/2:(oh-ih)/2"]
+        args = [
+            _ffmpeg(), "-y", "-v", "error",
+            "-f", "rawvideo", "-pix_fmt", "rgb24",
+            "-s", f"{self.width}x{self.height}", "-r", str(self.fps), "-i", "-",
+        ] + vf + encoder_args(encoder, **enc_kwargs) + ["-an", out_path]
+        self.proc = subprocess.Popen(
+            args, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        )
+        self.err_chunks = []
+        self.drain = threading.Thread(target=lambda: self.err_chunks.append(self.proc.stderr.read()))
+        self.drain.start()
+
+    def write_bytes(self, chunk):
+        self.proc.stdin.write(chunk)
+        self.written += 1
+
+    def write_hwc(self, frame):
+        self.write_bytes(_hwc_to_rgb_bytes(frame))
+
+    def write_bchw(self, frame, height, width):
+        frame = frame[:, :, :height, :width].float().clamp(0.0, 1.0)
+        self.write_hwc(frame[0].movedim(0, -1).contiguous())
+
+    def close(self):
+        try:
+            self.proc.stdin.close()
+            self.drain.join()
+            rc = self.proc.wait()
+        except Exception:
+            self.proc.kill()
+            self.proc.wait()
+            self.drain.join()
+            raise
+        stderr = b"".join(self.err_chunks)
+        if rc != 0:
+            raise Exception("ffmpeg encode failed:\n" + stderr.decode(*ENCODE_ARGS))
+        media = media_from_path(self.out_path, fps_hint=self.fps)
+        media["count"] = int(self.written)
+        media["width"], media["height"] = self.enc_w, self.enc_h
+        if media["fps"]:
+            media["duration"] = media["count"] / media["fps"]
+        return media
+
+
+def _iter_disk_hwc(media):
+    media = require_media(media)
+    width, height = int(media["width"]), int(media["height"])
+    frame_bytes = height * width * 3
+    if frame_bytes <= 0:
+        raise Exception("Disk media has invalid size")
+    args = [
+        _ffmpeg(), "-v", "error", "-i", media["path"],
+        "-vsync", "0", "-an", "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
+    ]
+    proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=frame_bytes)
+    err_chunks = []
+    drain = threading.Thread(target=lambda: err_chunks.append(proc.stderr.read()))
+    drain.start()
+    try:
+        while True:
+            raw = proc.stdout.read(frame_bytes)
+            if not raw:
+                break
+            if len(raw) < frame_bytes:
+                break
+            arr = np.frombuffer(raw, dtype=np.uint8, count=frame_bytes).reshape((height, width, 3)).copy()
+            yield torch.from_numpy(arr).to(dtype=torch.float32) / 255.0
+        rc = proc.wait()
+        drain.join()
+        if rc != 0:
+            err = b"".join(err_chunks).decode(*ENCODE_ARGS)
+            if err.strip():
+                raise Exception("ffmpeg decode failed:\n" + err)
+    except Exception:
+        proc.kill()
+        proc.wait()
+        drain.join()
+        raise
+
+
+def interpolate_disk_clip(media, ckpt_name, multiplier, out_path, encoder, keep_duration=True, pbar=None, **enc_kwargs):
+    from comfy import model_management
+    from comfy.ldm.common_dit import pad_to_patch_size
+
+    media = require_media(media)
+    total = int(media["count"])
+    width, height = int(media["width"]), int(media["height"])
+    fps = float(media["fps"]) or 24.0
+    if total < 2 or multiplier < 2:
+        run_ffmpeg([_ffmpeg(), "-y", "-v", "error", "-i", media["path"], "-c", "copy", "-an", out_path])
+        copied = media_from_path(out_path, fps_hint=fps)
+        copied["count"] = total
+        return copied
+
+    patcher = _load_interp_patcher(ckpt_name)
+    device = patcher.load_device
+    dtype = patcher.model_dtype()
+    inference_model = patcher.model
+    activation_mem = 0
+    mem_fn = getattr(inference_model, "memory_used_forward", None)
+    if callable(mem_fn):
+        try:
+            activation_mem = mem_fn((2, height, width, 3), dtype)
+        except Exception:
+            activation_mem = 0
+    model_management.load_models_gpu([patcher], memory_required=activation_mem)
+    inference_model = patcher.model
+    align = getattr(inference_model, "pad_align", 1)
+    if align <= 1 and hasattr(inference_model, "pyramid_levels"):
+        align = 2 ** max(int(inference_model.pyramid_levels) - 1, 1)
+    num_interp = multiplier - 1
+    t_values = [t / multiplier for t in range(1, multiplier)]
+    fps_out = fps * multiplier if keep_duration else fps
+    writer = _FfmpegFrameWriter(out_path, width, height, fps_out, encoder, **enc_kwargs)
+    total_steps = (total - 1) * num_interp
+    if pbar is None:
+        pbar = ProgressBar(max(total_steps, 1))
+
+    def prepare(frame_hwc):
+        frame = frame_hwc.unsqueeze(0).movedim(-1, 1).to(dtype=dtype, device=device)
+        if align > 1:
+            frame = pad_to_patch_size(frame, (align, align), padding_mode="reflect")
+        return frame
+
+    extract = getattr(inference_model, "extract_features", None)
+    multi_fn = getattr(inference_model, "forward_multi_timestep", None)
+    feat_cache = {}
+    prev_gpu = None
+    frames_in = 0
+    try:
+        for frame_hwc in _iter_disk_hwc(media):
+            frames_in += 1
+            src_bytes = _hwc_to_rgb_bytes(frame_hwc)
+            img1 = prepare(frame_hwc)
+            if prev_gpu is None:
+                writer.write_bytes(src_bytes)
+                prev_gpu = img1
+                if extract is not None:
+                    feat_cache["next"] = extract(img1)
+                continue
+            img0 = prev_gpu
+            if extract is not None:
+                feat_cache["img0"] = feat_cache.pop("next") if "next" in feat_cache else extract(img0)
+                feat_cache["img1"] = extract(img1)
+                feat_cache["next"] = feat_cache["img1"]
+            used_multi = False
+            if multi_fn is not None:
+                try:
+                    mids = multi_fn(img0, img1, t_values, cache=feat_cache)
+                    for k in range(mids.shape[0]):
+                        writer.write_bchw(mids[k:k + 1], height, width)
+                        pbar.update(1)
+                    used_multi = True
+                except model_management.OOM_EXCEPTION:
+                    model_management.soft_empty_cache()
+                    multi_fn = None
+            if not used_multi:
+                sample = img0
+                ts = torch.tensor(t_values, device=device, dtype=dtype).reshape(num_interp, 1, 1, 1)
+                ts = ts.expand(-1, 1, sample.shape[2], sample.shape[3])
+                for j in range(num_interp):
+                    kwargs = {"timestep": ts[j:j + 1]}
+                    try:
+                        mid = inference_model(img0, img1, cache=feat_cache, **kwargs)
+                    except TypeError:
+                        mid = inference_model(img0, img1, timestep=ts[j:j + 1])
+                    writer.write_bchw(mid, height, width)
+                    pbar.update(1)
+            writer.write_bytes(src_bytes)
+            prev_gpu = img1
+        media_out = writer.close()
+    except Exception:
+        try:
+            writer.proc.kill()
+            writer.proc.wait()
+        except Exception:
+            pass
+        raise
+    if frames_in != total:
+        logger.warn(f"Disk interpolate decoded {frames_in} frames, probe said {total}")
+    return media_out
+
+
+class DiskInterpolate:
+    @classmethod
+    def INPUT_TYPES(s):
+        ckpts = _interp_ckpt_names()
+        return {
+            "required": {
+                "disk": (DISK_TYPE,),
+                "ckpt_name": (ckpts,),
+                "multiplier": ("INT", {"default": 2, "min": 2, "max": 16, "step": 1}),
+                "keep_duration": ("BOOLEAN", {"default": True}),
+                "base_dir": ("STRING", {"default": os.path.join(PREFERRED_ROOT, DISK_SUBDIR)}),
+                **encoder_widgets(),
+            },
+            "hidden": {"unique_id": "UNIQUE_ID"},
+        }
+
+    CATEGORY = "Video Helper Suite 🎥🅥🅗🅢/disk"
+    RETURN_TYPES = (DISK_TYPE, "INT")
+    RETURN_NAMES = ("disk", "count")
+    FUNCTION = "interpolate"
+
+    def interpolate(self, disk, ckpt_name, multiplier, keep_duration, base_dir, encoder, unique_id=None, **kwargs):
+        media = require_media(disk)
+        out_path = new_clip_path(base_dir, unique_id, "interp")
+        total = max(int(media["count"]) - 1, 1) * (int(multiplier) - 1)
+        pbar = ProgressBar(max(total, 1))
+        result = interpolate_disk_clip(
+            media, ckpt_name, int(multiplier), out_path, encoder,
+            keep_duration=keep_duration, pbar=pbar, **kwargs,
+        )
+        return (result, result["count"])

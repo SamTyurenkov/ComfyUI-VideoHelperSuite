@@ -665,6 +665,21 @@ descriptions = {
          'save_output': 'If true, write to output directory; otherwise temp',
         },
     }],
+  "VHS_DiskInterpolate": ['Disk Interpolate 🎥🅥🅗🅢', short_desc('RIFE/FILM interpolate a disk clip without building an IMAGE batch in RAM'),
+    'Decodes two frames at a time, writes original + interpolated frames straight to a new mp4. Uses models from ComfyUI/models/frame_interpolation (rife_v4.25_heavy.safetensors).',
+    {'Inputs': {
+        'disk': 'VHS_DISK_MEDIA handle',
+        },
+     'Outputs': {
+         'disk': 'Interpolated clip',
+         'count': 'Output frame count, (N-1)*multiplier+1',
+        },
+     'Widgets': {
+         'ckpt_name': 'Checkpoint in models/frame_interpolation. Select rife_v4.25_heavy or film_net_fp16',
+         'multiplier': '2 = one in-between frame per pair',
+         'keep_duration': 'If true, fps is multiplied so duration stays the same',
+        },
+    }],
 }
 
 def as_html(entry, depth=0):

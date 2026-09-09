@@ -2071,7 +2071,7 @@ app.registerExtension({
                 addFormatWidgets(nodeType, nodeData);
                 addVAEInputToggle(nodeType, nodeData)
             }
-        } else if (["VHS_ImagesToDisk", "VHS_MergeDisk", "VHS_AppendImagesToDisk"].includes(nodeData?.name)) {
+        } else if (["VHS_ImagesToDisk", "VHS_MergeDisk", "VHS_AppendImagesToDisk", "VHS_DiskInterpolate"].includes(nodeData?.name)) {
             addFormatWidgets(nodeType, nodeData, "encoder");
         } else if (nodeData?.name == "VHS_SaveImageSequence") {
             //Disabled for safety as VHS_SaveImageSequence is not currently merged
