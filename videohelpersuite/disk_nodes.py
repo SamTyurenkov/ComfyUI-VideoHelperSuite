@@ -148,6 +148,7 @@ def encoder_args(encoder, **kwargs):
         if encoder == "h264_nvenc":
             return [
                 "-c:v", "h264_nvenc", "-preset", "p4",
+                "-profile:v", "high", "-level", "5.2",
                 "-rc", "cbr", "-b:v", br, "-pix_fmt", "yuv420p",
             ]
         return [
@@ -159,6 +160,7 @@ def encoder_args(encoder, **kwargs):
     if encoder == "h264_nvenc":
         return [
             "-c:v", "h264_nvenc", "-preset", "p4",
+            "-profile:v", "high", "-level", "5.2",
             "-rc", "constqp", "-qp", str(crf), "-cq", str(crf),
             "-pix_fmt", "yuv420p",
         ]
@@ -837,9 +839,27 @@ class _FfmpegFrameWriter:
         self.err_chunks = []
         self.drain = threading.Thread(target=lambda: self.err_chunks.append(self.proc.stderr.read()))
         self.drain.start()
+        rc = self.proc.poll()
+        if rc is not None:
+            raise Exception(self._encoder_died(rc))
+
+    def _encoder_died(self, rc=None):
+        try:
+            self.drain.join(timeout=2)
+        except Exception:
+            pass
+        if rc is None:
+            rc = self.proc.poll()
+        err = b"".join(self.err_chunks).decode(*ENCODE_ARGS).strip()
+        return f"ffmpeg encoder died (exit {rc}):\n{err or '(no stderr)'}"
 
     def write_bytes(self, chunk):
-        self.proc.stdin.write(chunk)
+        if self.proc.poll() is not None:
+            raise Exception(self._encoder_died())
+        try:
+            self.proc.stdin.write(chunk)
+        except BrokenPipeError as e:
+            raise Exception(self._encoder_died()) from e
         self.written += 1
 
     def write_hwc(self, frame):
@@ -1443,14 +1463,13 @@ class DiskRTXUpscale:
         }
         selected = quality_mapping.get(quality, nvvfx.effects.QualityLevel.HIGH)
         out_path = new_clip_path(base_dir, unique_id, "vsr")
-        writer = None
+        writer = _FfmpegFrameWriter(out_path, out_w, out_h, media["fps"], encoder, **kwargs)
         pbar = ProgressBar(max(int(media["count"]), 1))
         try:
             with nvvfx.VideoSuperRes(selected) as sr:
                 sr.output_width = out_w
                 sr.output_height = out_h
                 sr.load()
-                writer = _FfmpegFrameWriter(out_path, out_w, out_h, media["fps"], encoder, **kwargs)
                 for frame in _iter_disk_hwc(media):
                     inp = frame.movedim(-1, 0).float().contiguous().cuda()
                     # nvvfx capsule aliases C++ memory — clone before the next run()
@@ -1458,8 +1477,6 @@ class DiskRTXUpscale:
                     writer.write_hwc(up.movedim(0, -1).float().clamp(0, 1))
                     del inp, up
                     pbar.update(1)
-            if writer is None:
-                raise Exception("RTX VSR failed before encoding started")
             result = writer.close()
         except Exception:
             if writer is not None:
