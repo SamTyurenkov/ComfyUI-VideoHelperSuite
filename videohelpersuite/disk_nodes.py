@@ -14,7 +14,7 @@ import folder_paths
 from comfy.utils import ProgressBar
 
 from .logger import logger
-from .utils import BIGMAX, BIGMIN, ENCODE_ARGS, ffmpeg_path, floatOrInt, hash_path, strip_path, validate_path
+from .utils import BIGMAX, BIGMIN, ENCODE_ARGS, ffmpeg_path, floatOrInt, hash_path, strip_path, validate_path, embed_comfy_video_metadata
 
 DISK_TYPE = "VHS_DISK_MEDIA"
 PREFERRED_ROOT = "/root/autodl-tmp"
@@ -709,6 +709,10 @@ class DiskCombine:
             "optional": {
                 "audio": ("AUDIO",),
             },
+            "hidden": {
+                "prompt": "PROMPT",
+                "extra_pnginfo": "EXTRA_PNGINFO",
+            },
         }
 
     CATEGORY = "Video Helper Suite 🎥🅥🅗🅢/disk"
@@ -717,7 +721,7 @@ class DiskCombine:
     OUTPUT_NODE = True
     FUNCTION = "combine"
 
-    def combine(self, disk, filename_prefix="DiskCombine", save_output=True, audio=None):
+    def combine(self, disk, filename_prefix="DiskCombine", save_output=True, audio=None, prompt=None, extra_pnginfo=None):
         media = require_media(disk)
         output_dir = (
             folder_paths.get_output_directory()
@@ -750,6 +754,7 @@ class DiskCombine:
             preview = audio_path
         else:
             preview = file_path
+        embed_comfy_video_metadata(preview, prompt, extra_pnginfo)
         gif_preview = {
             "filename": os.path.basename(preview),
             "subfolder": subfolder,

@@ -1,4 +1,5 @@
 import hashlib
+import json
 import os
 from typing import Iterable
 import shutil
@@ -421,6 +422,66 @@ def select_indexes_from_str(input_obj: Union[Tensor, list], indexes: str, err_if
     if err_if_empty and len(real_idxs) == 0:
         raise Exception(f"Nothing was selected based on indexes found in '{indexes}'.")
     return select_indexes(input_obj, real_idxs)
+
+_ISOBMFF_EXTS = {".mp4", ".mov", ".m4v"}
+
+
+def embed_comfy_video_metadata(path, prompt=None, extra_pnginfo=None):
+    """Write prompt/workflow tags the ComfyUI frontend reads on mp4/mov drag-drop.
+
+    Matches native SaveVideo: PyAV remux with movflags=use_metadata_tags.
+    ffmpeg `-c copy` / VHS FFMETADATA tags are not the udta.meta.keys boxes
+    that getFromIsobmffFile parses.
+    """
+    if not path or os.path.splitext(path)[1].lower() not in _ISOBMFF_EXTS:
+        return
+    try:
+        from comfy.cli_args import args
+        if getattr(args, "disable_metadata", False):
+            return
+    except Exception:
+        pass
+    metadata = {}
+    if isinstance(extra_pnginfo, dict):
+        metadata.update(extra_pnginfo)
+    if prompt is not None:
+        metadata["prompt"] = prompt
+    if not metadata:
+        return
+    try:
+        import av
+        from av.subtitles.stream import SubtitleStream
+    except ImportError:
+        logger.warn("PyAV is required to embed workflow metadata in video output")
+        return
+    tmp = path + ".meta.tmp" + os.path.splitext(path)[1]
+    try:
+        with av.open(path, mode="r") as src:
+            with av.open(tmp, mode="w", options={"movflags": "use_metadata_tags"}) as dst:
+                for key, value in src.metadata.items():
+                    if key not in metadata:
+                        dst.metadata[key] = value
+                for key, value in metadata.items():
+                    dst.metadata[key] = value if isinstance(value, str) else json.dumps(value)
+                stream_map = {}
+                for stream in src.streams:
+                    if isinstance(stream, (av.VideoStream, av.AudioStream, SubtitleStream)):
+                        stream_map[stream] = dst.add_stream_from_template(
+                            template=stream, opaque=True
+                        )
+                for packet in src.demux():
+                    if packet.stream in stream_map and packet.dts is not None:
+                        packet.stream = stream_map[packet.stream]
+                        dst.mux(packet)
+        os.replace(tmp, path)
+    except Exception:
+        logger.exception("Failed to embed ComfyUI workflow metadata in %s", path)
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+
 
 def hook(obj, attr):
     def dec(f):

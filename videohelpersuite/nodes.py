@@ -26,7 +26,7 @@ from .disk_nodes import ImagesToDisk, PathToDisk, MergeDisk, AppendImagesToDisk,
 from .utils import ffmpeg_path, get_audio, hash_path, validate_path, requeue_workflow, \
         gifski_path, calculate_file_hash, strip_path, try_download_video, is_url, \
         imageOrLatent, BIGMAX, merge_filter_args, ENCODE_ARGS, floatOrInt, cached, \
-        ContainsAll
+        ContainsAll, embed_comfy_video_metadata
 from comfy.utils import ProgressBar
 
 if 'VHS_video_formats' not in folder_paths.folder_names_and_paths:
@@ -621,6 +621,12 @@ class VideoCombine:
             for intermediate in output_files[1:-1]:
                 if os.path.exists(intermediate):
                     os.remove(intermediate)
+        if (
+            str(format).startswith("video/")
+            and str(kwargs.get("save_metadata", True)).lower() not in ("false", "0")
+            and output_files
+        ):
+            embed_comfy_video_metadata(output_files[-1], prompt, extra_pnginfo)
         output_type = "output" if save_output else "temp"
         preview = {
                 "filename": file,
