@@ -435,6 +435,17 @@ function fitHeight(node) {
     node.setSize([node.size[0], node.computeSize([node.size[0], node.size[1]])[1]])
     node?.graph?.setDirtyCanvas(true);
 }
+function stripNativeImagePreview(node) {
+    if (!node?.widgets) {
+        return
+    }
+    const nativePreview = node.widgets.findIndex((w) => w.name == '$$canvas-image-preview')
+    if (nativePreview >= 0) {
+        node.imgs = []
+        node.widgets.splice(nativePreview, 1)
+        fitHeight(node)
+    }
+}
 function startDraggingItems(node, pointer) {
     app.canvas.emitBeforeChange()
     app.canvas.graph?.beforeChange()
@@ -1807,6 +1818,19 @@ function mouseAnnotated(event, [x, y], node) {
     return true
 }
 let latentPreviewNodes = new Set()
+function applyVhsGifsFromOutputs(nodeOutputs) {
+    if (!nodeOutputs) {
+        return
+    }
+    for (const [nodeId, out] of Object.entries(nodeOutputs)) {
+        if (!out?.gifs?.length) {
+            continue
+        }
+        const node = getNodeById(nodeId)
+        node?.updateParameters?.(out.gifs[0], true)
+        stripNativeImagePreview(node)
+    }
+}
 app.registerExtension({
     name: "VideoHelperSuite.Core",
     settings: [
@@ -2064,6 +2088,7 @@ app.registerExtension({
                 if (message?.gifs) {
                     this.updateParameters(message.gifs[0], true);
                 }
+                stripNativeImagePreview(this)
             });
             addVideoPreview(nodeType, false);
             addPreviewOptions(nodeType);
@@ -2442,6 +2467,11 @@ app.registerExtension({
             }
         }
     },
+    // History "open workflow" sets nodeOutputs without a live `executed` event.
+    // Preview Image nodes pick that up via `images`; VHS previews live on `gifs`.
+    onNodeOutputsUpdated(nodeOutputs) {
+        applyVhsGifsFromOutputs(nodeOutputs)
+    },
 });
 let previewImages = []
 api.addEventListener('executing', ({ detail }) => {
@@ -2584,13 +2614,7 @@ async function restorePreviewsFromHistory() {
     //history is keyed by prompt_id in chronological order; letting later
     //entries overwrite earlier ones leaves each node showing its newest output.
     for (const entry of Object.values(history ?? {})) {
-        const outputs = entry?.outputs ?? {}
-        for (const [nodeId, out] of Object.entries(outputs)) {
-            if (!out?.gifs?.length) {
-                continue
-            }
-            getNodeById(nodeId)?.updateParameters?.(out.gifs[0], true)
-        }
+        applyVhsGifsFromOutputs(entry?.outputs)
     }
 }
 api.addEventListener('reconnected', restorePreviewsFromHistory)

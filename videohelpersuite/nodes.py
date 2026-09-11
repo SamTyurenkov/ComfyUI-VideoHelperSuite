@@ -621,10 +621,11 @@ class VideoCombine:
             for intermediate in output_files[1:-1]:
                 if os.path.exists(intermediate):
                     os.remove(intermediate)
+        output_type = "output" if save_output else "temp"
         preview = {
                 "filename": file,
                 "subfolder": subfolder,
-                "type": "output" if save_output else "temp",
+                "type": output_type,
                 "format": format,
                 "frame_rate": frame_rate,
                 "workflow": first_image_file,
@@ -633,7 +634,26 @@ class VideoCombine:
         if num_frames == 1 and 'png' in format and '%03d' in file:
             preview['format'] = 'image/png'
             preview['filename'] = file.replace('%03d', '001')
-        return {"ui": {"gifs": [preview]}, "result": ((save_output, output_files),)}
+        # ComfyUI history/"open workflow" follows the Preview Image contract:
+        # ui.images + PNG tEXt. VHS used to report only `gifs`, so the history
+        # item was the video file and that load path never saw the metadata PNG.
+        metadata_png = os.path.join(full_output_folder, first_image_file)
+        if extra_options.get('VHS_MetadataImage', True) != False and os.path.exists(metadata_png):
+            image_preview = {
+                "filename": first_image_file,
+                "subfolder": subfolder,
+                "type": output_type,
+            }
+        else:
+            image_preview = preview
+        return {
+            "ui": {
+                "images": [image_preview],
+                "gifs": [preview],
+                "animated": (True,),
+            },
+            "result": ((save_output, output_files),),
+        }
 
 class LoadAudio:
     @classmethod

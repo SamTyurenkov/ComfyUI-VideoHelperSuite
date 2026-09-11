@@ -750,16 +750,19 @@ class DiskCombine:
             preview = audio_path
         else:
             preview = file_path
+        gif_preview = {
+            "filename": os.path.basename(preview),
+            "subfolder": subfolder,
+            "type": "output" if save_output else "temp",
+            "format": "video/mp4",
+            "frame_rate": media["fps"],
+            "fullpath": preview,
+        }
         return {
             "ui": {
-                "gifs": [{
-                    "filename": os.path.basename(preview),
-                    "subfolder": subfolder,
-                    "type": "output" if save_output else "temp",
-                    "format": "video/mp4",
-                    "frame_rate": media["fps"],
-                    "fullpath": preview,
-                }]
+                "images": [gif_preview],
+                "gifs": [gif_preview],
+                "animated": (True,),
             },
             "result": ((save_output, output_files),),
         }
