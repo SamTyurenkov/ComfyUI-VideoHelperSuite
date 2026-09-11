@@ -20,6 +20,19 @@ DISK_TYPE = "VHS_DISK_MEDIA"
 PREFERRED_ROOT = "/root/autodl-tmp"
 DISK_SUBDIR = "vhs_disk"
 
+# Same contract as RAM VHS: IMAGE/PNG is full-range RGB; disk h264 is TV BT.709.
+VF_RGB_FULL_TO_YUV_TV = "scale=in_color_matrix=bt709:out_color_matrix=bt709:in_range=full:out_range=tv"
+VF_YUV_TV_TO_RGB_FULL = "scale=in_color_matrix=bt709:out_color_matrix=bt709:in_range=tv:out_range=full"
+SCALE_YUV_TV = "in_color_matrix=bt709:out_color_matrix=bt709:in_range=tv:out_range=tv"
+RGB_INPUT_COLOR = [
+    "-color_range", "pc", "-colorspace", "rgb",
+    "-color_primaries", "bt709", "-color_trc", "bt709",
+]
+YUV_OUTPUT_COLOR = [
+    "-color_range", "tv", "-colorspace", "bt709",
+    "-color_primaries", "bt709", "-color_trc", "bt709",
+]
+
 _nvenc_available = None
 
 
@@ -146,25 +159,60 @@ def encoder_args(encoder, **kwargs):
         suffix = "M" if _truthy(kwargs.get("megabit", True)) else "K"
         br = f"{bitrate}{suffix}"
         if encoder == "h264_nvenc":
-            return [
+            args = [
                 "-c:v", "h264_nvenc", "-preset", "p4",
                 "-profile:v", "high", "-level", "5.2",
                 "-rc", "cbr", "-b:v", br, "-pix_fmt", "yuv420p",
             ]
-        return [
-            "-c:v", "libx264", "-preset", "veryfast",
-            "-b:v", br, "-maxrate", br, "-bufsize", f"{bitrate * 2}{suffix}",
-            "-pix_fmt", "yuv420p",
-        ]
-    crf = int(kwargs.get("crf", kwargs.get("quality", 18)))
-    if encoder == "h264_nvenc":
-        return [
-            "-c:v", "h264_nvenc", "-preset", "p4",
-            "-profile:v", "high", "-level", "5.2",
-            "-rc", "constqp", "-qp", str(crf), "-cq", str(crf),
-            "-pix_fmt", "yuv420p",
-        ]
-    return ["-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf), "-pix_fmt", "yuv420p"]
+        else:
+            args = [
+                "-c:v", "libx264", "-preset", "veryfast",
+                "-b:v", br, "-maxrate", br, "-bufsize", f"{bitrate * 2}{suffix}",
+                "-pix_fmt", "yuv420p",
+            ]
+    else:
+        crf = int(kwargs.get("crf", kwargs.get("quality", 18)))
+        if encoder == "h264_nvenc":
+            args = [
+                "-c:v", "h264_nvenc", "-preset", "p4",
+                "-profile:v", "high", "-level", "5.2",
+                "-rc", "constqp", "-qp", str(crf), "-cq", str(crf),
+                "-pix_fmt", "yuv420p",
+            ]
+        else:
+            args = ["-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf), "-pix_fmt", "yuv420p"]
+    return args + YUV_OUTPUT_COLOR
+
+
+def rgb_input_args(width, height, fps):
+    return [
+        "-f", "rawvideo", "-pix_fmt", "rgb24",
+        *RGB_INPUT_COLOR,
+        "-s", f"{width}x{height}", "-r", str(fps), "-i", "-",
+    ]
+
+
+def rgb_to_yuv_vf(width, height):
+    enc_w, enc_h = even_size(width, height)
+    parts = []
+    if (enc_w, enc_h) != (width, height):
+        parts.append(f"pad={enc_w}:{enc_h}:(ow-iw)/2:(oh-ih)/2")
+    parts.append(VF_RGB_FULL_TO_YUV_TV)
+    return ["-vf", ",".join(parts)], (enc_w, enc_h)
+
+
+def yuv_to_rgb_vf(*parts):
+    filters = [part for part in parts if part] + [VF_YUV_TV_TO_RGB_FULL]
+    return ["-vf", ",".join(filters)]
+
+
+def yuv_keep_filter(scale_wh, fps):
+    if scale_wh:
+        width, height = scale_wh
+        scale = f"scale=w={width}:h={height}:{SCALE_YUV_TV}"
+    else:
+        scale = f"scale={SCALE_YUV_TV}"
+    return f"{scale},fps={fps}"
 
 
 NVENC_RATE_WIDGETS = [
@@ -318,14 +366,10 @@ def encode_images_to_file(images, out_path, fps, encoder, pbar=None, **enc_kwarg
     if images.ndim == 3:
         images = images.unsqueeze(0)
     height, width = int(images.shape[1]), int(images.shape[2])
-    enc_w, enc_h = even_size(width, height)
-    vf = []
-    if (enc_w, enc_h) != (width, height):
-        vf = ["-vf", f"pad={enc_w}:{enc_h}:(ow-iw)/2:(oh-ih)/2"]
+    vf, (enc_w, enc_h) = rgb_to_yuv_vf(width, height)
     args = [
         _ffmpeg(), "-y", "-v", "error",
-        "-f", "rawvideo", "-pix_fmt", "rgb24",
-        "-s", f"{width}x{height}", "-r", str(fps), "-i", "-",
+        *rgb_input_args(width, height, fps),
     ] + vf + encoder_args(encoder, **enc_kwargs) + ["-an", out_path]
     proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     err_chunks = []
@@ -390,8 +434,8 @@ def concat_media(media_a, media_b, out_path, encoder, merge_strategy="match A", 
                 target_w, target_h, fps = b["width"], b["height"], b["fps"]
                 scale_a, scale_b = True, False
     target_w, target_h = even_size(target_w, target_h)
-    fa = f"scale={target_w}:{target_h},fps={fps}" if scale_a else f"fps={fps}"
-    fb = f"scale={target_w}:{target_h},fps={fps}" if scale_b else f"fps={fps}"
+    fa = yuv_keep_filter((target_w, target_h) if scale_a else None, fps)
+    fb = yuv_keep_filter((target_w, target_h) if scale_b else None, fps)
     filter_complex = f"[0:v]{fa}[v0];[1:v]{fb}[v1];[v0][v1]concat=n=2:v=1:a=0[v]"
     run_ffmpeg([
         _ffmpeg(), "-y", "-v", "error",
@@ -443,7 +487,7 @@ def load_frame_window(media, start, count, pbar=None):
     end = start + count - 1
     raw = _ffmpeg_raw([
         _ffmpeg(), "-v", "error", "-i", media["path"],
-        "-vf", f"select=between(n\\,{start}\\,{end})",
+        *yuv_to_rgb_vf(f"select=between(n\\,{start}\\,{end})"),
         "-vsync", "0", "-frames:v", str(count),
         "-an", "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
     ])
@@ -456,6 +500,7 @@ def load_frame_window(media, start, count, pbar=None):
         raw = _ffmpeg_raw([
             _ffmpeg(), "-v", "error",
             "-sseof", f"-{leftover:.6f}", "-i", media["path"],
+            *yuv_to_rgb_vf(),
             "-vsync", "0", "-frames:v", str(count + extra),
             "-an", "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
         ])
@@ -823,15 +868,11 @@ class _FfmpegFrameWriter:
         self.fps = float(fps)
         self.written = 0
         self.out_path = out_path
-        enc_w, enc_h = even_size(self.width, self.height)
+        vf, (enc_w, enc_h) = rgb_to_yuv_vf(self.width, self.height)
         self.enc_w, self.enc_h = enc_w, enc_h
-        vf = []
-        if (enc_w, enc_h) != (self.width, self.height):
-            vf = ["-vf", f"pad={enc_w}:{enc_h}:(ow-iw)/2:(oh-ih)/2"]
         args = [
             _ffmpeg(), "-y", "-v", "error",
-            "-f", "rawvideo", "-pix_fmt", "rgb24",
-            "-s", f"{self.width}x{self.height}", "-r", str(self.fps), "-i", "-",
+            *rgb_input_args(self.width, self.height, self.fps),
         ] + vf + encoder_args(encoder, **enc_kwargs) + ["-an", out_path]
         self.proc = subprocess.Popen(
             args, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
@@ -897,13 +938,13 @@ def _iter_disk_hwc(media, every=1):
     if frame_bytes <= 0:
         raise Exception("Disk media has invalid size")
     every = max(int(every), 1)
+    select = f"select=not(mod(n\\,{every}))" if every > 1 else None
     args = [
         _ffmpeg(), "-v", "error", "-i", media["path"],
         "-vsync", "0", "-an",
+        *yuv_to_rgb_vf(select),
+        "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
     ]
-    if every > 1:
-        args += ["-vf", f"select=not(mod(n\\,{every}))"]
-    args += ["-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
     proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=frame_bytes)
     err_chunks = []
     drain = threading.Thread(target=lambda: err_chunks.append(proc.stderr.read()))
@@ -1299,6 +1340,7 @@ class ReverseDisk:
         raw_path = out_path + ".raw"
         args = [
             _ffmpeg(), "-v", "error", "-i", media["path"],
+            *yuv_to_rgb_vf(),
             "-vsync", "0", "-an", "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
         ]
         proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=frame_bytes)
