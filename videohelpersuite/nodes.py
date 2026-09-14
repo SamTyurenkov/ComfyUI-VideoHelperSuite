@@ -26,7 +26,7 @@ from .disk_nodes import ImagesToDisk, PathToDisk, MergeDisk, AppendImagesToDisk,
 from .utils import ffmpeg_path, get_audio, hash_path, validate_path, requeue_workflow, \
         gifski_path, calculate_file_hash, strip_path, try_download_video, is_url, \
         imageOrLatent, BIGMAX, merge_filter_args, ENCODE_ARGS, floatOrInt, cached, \
-        ContainsAll, embed_comfy_video_metadata
+        ContainsAll
 from comfy.utils import ProgressBar
 
 if 'VHS_video_formats' not in folder_paths.folder_names_and_paths:
@@ -621,12 +621,6 @@ class VideoCombine:
             for intermediate in output_files[1:-1]:
                 if os.path.exists(intermediate):
                     os.remove(intermediate)
-        if (
-            str(format).startswith("video/")
-            and str(kwargs.get("save_metadata", True)).lower() not in ("false", "0")
-            and output_files
-        ):
-            embed_comfy_video_metadata(output_files[-1], prompt, extra_pnginfo)
         output_type = "output" if save_output else "temp"
         preview = {
                 "filename": file,
@@ -640,21 +634,9 @@ class VideoCombine:
         if num_frames == 1 and 'png' in format and '%03d' in file:
             preview['format'] = 'image/png'
             preview['filename'] = file.replace('%03d', '001')
-        # ComfyUI history/"open workflow" follows the Preview Image contract:
-        # ui.images + PNG tEXt. VHS used to report only `gifs`, so the history
-        # item was the video file and that load path never saw the metadata PNG.
-        metadata_png = os.path.join(full_output_folder, first_image_file)
-        if extra_options.get('VHS_MetadataImage', True) != False and os.path.exists(metadata_png):
-            image_preview = {
-                "filename": first_image_file,
-                "subfolder": subfolder,
-                "type": output_type,
-            }
-        else:
-            image_preview = preview
         return {
             "ui": {
-                "images": [image_preview],
+                "images": [preview],
                 "gifs": [preview],
                 "animated": (True,),
             },

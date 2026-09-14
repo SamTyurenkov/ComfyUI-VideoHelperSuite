@@ -427,13 +427,14 @@ _ISOBMFF_EXTS = {".mp4", ".mov", ".m4v"}
 
 
 def embed_comfy_video_metadata(path, prompt=None, extra_pnginfo=None):
-    """Write prompt/workflow tags the ComfyUI frontend reads on mp4/mov drag-drop.
+    """Stream-copy workflow/prompt tags into an mp4/mov for canvas drag-drop.
 
-    Matches native SaveVideo: PyAV remux with movflags=use_metadata_tags.
-    ffmpeg `-c copy` / VHS FFMETADATA tags are not the udta.meta.keys boxes
-    that getFromIsobmffFile parses.
+    Must not re-encode: PyAV remux on this stack inflated an 8s clip from
+    ~3MB to ~14MB and broke Video Combine download/playback.
     """
-    if not path or os.path.splitext(path)[1].lower() not in _ISOBMFF_EXTS:
+    if not path or ffmpeg_path is None:
+        return
+    if os.path.splitext(path)[1].lower() not in _ISOBMFF_EXTS:
         return
     try:
         from comfy.cli_args import args
@@ -441,44 +442,57 @@ def embed_comfy_video_metadata(path, prompt=None, extra_pnginfo=None):
             return
     except Exception:
         pass
-    metadata = {}
+    video_metadata = {}
     if isinstance(extra_pnginfo, dict):
-        metadata.update(extra_pnginfo)
+        video_metadata.update(extra_pnginfo)
     if prompt is not None:
-        metadata["prompt"] = prompt
-    if not metadata:
+        video_metadata["prompt"] = prompt
+    if not video_metadata:
         return
+
+    def escape_ffmpeg_metadata(key, value):
+        value = str(value).replace("\\", "\\\\").replace(";", "\\;")
+        value = value.replace("#", "\\#").replace("=", "\\=").replace("\n", "\\\n")
+        return f"{key}={value}"
+
+    ext = os.path.splitext(path)[1]
+    meta_path = path + ".ffmeta"
+    tmp = path + ".meta.tmp" + ext
     try:
-        import av
-        from av.subtitles.stream import SubtitleStream
-    except ImportError:
-        logger.warn("PyAV is required to embed workflow metadata in video output")
-        return
-    tmp = path + ".meta.tmp" + os.path.splitext(path)[1]
-    try:
-        with av.open(path, mode="r") as src:
-            with av.open(tmp, mode="w", options={"movflags": "use_metadata_tags"}) as dst:
-                for key, value in src.metadata.items():
-                    if key not in metadata:
-                        dst.metadata[key] = value
-                for key, value in metadata.items():
-                    dst.metadata[key] = value if isinstance(value, str) else json.dumps(value)
-                stream_map = {}
-                for stream in src.streams:
-                    if isinstance(stream, (av.VideoStream, av.AudioStream, SubtitleStream)):
-                        stream_map[stream] = dst.add_stream_from_template(
-                            template=stream, opaque=True
-                        )
-                for packet in src.demux():
-                    if packet.stream in stream_map and packet.dts is not None:
-                        packet.stream = stream_map[packet.stream]
-                        dst.mux(packet)
+        with open(meta_path, "w", encoding="utf-8") as f:
+            f.write(";FFMETADATA1\n")
+            if "prompt" in video_metadata:
+                f.write(escape_ffmpeg_metadata("prompt", json.dumps(video_metadata["prompt"])) + "\n")
+            if "workflow" in video_metadata:
+                f.write(escape_ffmpeg_metadata("workflow", json.dumps(video_metadata["workflow"])) + "\n")
+            for key, value in video_metadata.items():
+                if key in ("prompt", "workflow"):
+                    continue
+                f.write(escape_ffmpeg_metadata(key, json.dumps(value)) + "\n")
+        subprocess.run(
+            [
+                ffmpeg_path, "-y", "-v", "error",
+                "-i", path, "-i", meta_path,
+                "-map", "0", "-c", "copy",
+                "-map_metadata", "1",
+                "-movflags", "use_metadata_tags",
+                tmp,
+            ],
+            check=True,
+            capture_output=True,
+        )
         os.replace(tmp, path)
     except Exception:
         logger.exception("Failed to embed ComfyUI workflow metadata in %s", path)
         try:
             if os.path.exists(tmp):
                 os.remove(tmp)
+        except OSError:
+            pass
+    finally:
+        try:
+            if os.path.exists(meta_path):
+                os.remove(meta_path)
         except OSError:
             pass
 
