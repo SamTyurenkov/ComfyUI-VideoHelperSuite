@@ -638,7 +638,6 @@ class VideoCombine:
             "ui": {
                 "images": [preview],
                 "gifs": [preview],
-                "animated": (True,),
             },
             "result": ((save_output, output_files),),
         }

@@ -767,7 +767,6 @@ class DiskCombine:
             "ui": {
                 "images": [gif_preview],
                 "gifs": [gif_preview],
-                "animated": (True,),
             },
             "result": ((save_output, output_files),),
         }

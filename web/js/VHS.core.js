@@ -435,16 +435,37 @@ function fitHeight(node) {
     node.setSize([node.size[0], node.computeSize([node.size[0], node.size[1]])[1]])
     node?.graph?.setDirtyCanvas(true);
 }
+const NATIVE_PREVIEW_WIDGETS = new Set(["$$canvas-image-preview", "video-preview"])
 function stripNativeImagePreview(node) {
     if (!node?.widgets) {
         return
     }
-    const nativePreview = node.widgets.findIndex((w) => w.name == '$$canvas-image-preview')
-    if (nativePreview >= 0) {
+    let removed = false
+    for (let i = node.widgets.length - 1; i >= 0; i--) {
+        const widget = node.widgets[i]
+        if (!NATIVE_PREVIEW_WIDGETS.has(widget.name)) {
+            continue
+        }
+        widget.onRemove?.()
+        node.widgets.splice(i, 1)
+        removed = true
+    }
+    if (node.videoContainer) {
+        node.videoContainer.replaceChildren?.()
+        node.videoContainer = undefined
+        removed = true
+    }
+    if (node.imgs?.length) {
         node.imgs = []
-        node.widgets.splice(nativePreview, 1)
+        removed = true
+    }
+    if (removed) {
         fitHeight(node)
     }
+}
+function keepNativePreviewStripped(node) {
+    stripNativeImagePreview(node)
+    requestAnimationFrame(() => stripNativeImagePreview(node))
 }
 function startDraggingItems(node, pointer) {
     app.canvas.emitBeforeChange()
@@ -1828,7 +1849,7 @@ function applyVhsGifsFromOutputs(nodeOutputs) {
         }
         const node = getNodeById(nodeId)
         node?.updateParameters?.(out.gifs[0], true)
-        stripNativeImagePreview(node)
+        keepNativePreviewStripped(node)
     }
 }
 app.registerExtension({
@@ -2088,6 +2109,9 @@ app.registerExtension({
                 if (message?.gifs) {
                     this.updateParameters(message.gifs[0], true);
                 }
+                keepNativePreviewStripped(this)
+            });
+            chainCallback(nodeType.prototype, "onDrawBackground", function() {
                 stripNativeImagePreview(this)
             });
             addVideoPreview(nodeType, false);
