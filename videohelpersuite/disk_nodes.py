@@ -152,8 +152,46 @@ def _truthy(value, default=True):
     return bool(value)
 
 
-def encoder_args(encoder, **kwargs):
+# ITU-T H.264 Annex A, High profile: (level, MaxMBPS, MaxFS, MaxBR kbps)
+_H264_LEVELS = (
+    ("4.0", 245760, 8192, 25000),
+    ("4.1", 245760, 8192, 62500),
+    ("4.2", 522240, 8704, 62500),
+    ("5.0", 589824, 22080, 168750),
+    ("5.1", 983040, 36864, 300000),
+    ("5.2", 2073600, 36864, 300000),
+    ("6.0", 4177920, 139264, 300000),
+    ("6.1", 8355840, 139264, 600000),
+    ("6.2", 16711680, 139264, 1000000),
+)
+
+
+def _bitrate_kbps(kwargs):
+    if "bitrate" not in kwargs or kwargs.get("crf") is not None:
+        return None
+    bitrate = int(kwargs.get("bitrate", 50))
+    if _truthy(kwargs.get("megabit", True)):
+        return bitrate * 1000
+    return bitrate
+
+
+def h264_level(width, height, fps, bitrate_kbps=None):
+    mb_w = (max(int(width), 1) + 15) // 16
+    mb_h = (max(int(height), 1) + 15) // 16
+    frame_mbs = mb_w * mb_h
+    mbps = frame_mbs * max(float(fps), 1.0)
+    br = 0 if bitrate_kbps is None else max(int(bitrate_kbps), 0)
+    for name, max_mbps, max_fs, max_br in _H264_LEVELS:
+        if frame_mbs <= max_fs and mbps <= max_mbps and br <= max_br:
+            return name
+    return "6.2"
+
+
+def encoder_args(encoder, width=None, height=None, fps=None, **kwargs):
     encoder = pick_encoder(encoder)
+    level = "auto"
+    if width and height and fps:
+        level = h264_level(width, height, fps, _bitrate_kbps(kwargs))
     if "bitrate" in kwargs and kwargs.get("crf") is None:
         bitrate = int(kwargs.get("bitrate", 50))
         suffix = "M" if _truthy(kwargs.get("megabit", True)) else "K"
@@ -161,7 +199,7 @@ def encoder_args(encoder, **kwargs):
         if encoder == "h264_nvenc":
             args = [
                 "-c:v", "h264_nvenc", "-preset", "p4",
-                "-profile:v", "high", "-level", "5.2",
+                "-profile:v", "high", "-level", level,
                 "-rc", "cbr", "-b:v", br, "-pix_fmt", "yuv420p",
             ]
         else:
@@ -175,7 +213,7 @@ def encoder_args(encoder, **kwargs):
         if encoder == "h264_nvenc":
             args = [
                 "-c:v", "h264_nvenc", "-preset", "p4",
-                "-profile:v", "high", "-level", "5.2",
+                "-profile:v", "high", "-level", level,
                 "-rc", "constqp", "-qp", str(crf), "-cq", str(crf),
                 "-pix_fmt", "yuv420p",
             ]
@@ -370,7 +408,7 @@ def encode_images_to_file(images, out_path, fps, encoder, pbar=None, **enc_kwarg
     args = [
         _ffmpeg(), "-y", "-v", "error",
         *rgb_input_args(width, height, fps),
-    ] + vf + encoder_args(encoder, **enc_kwargs) + ["-an", out_path]
+    ] + vf + encoder_args(encoder, width=enc_w, height=enc_h, fps=fps, **enc_kwargs) + ["-an", out_path]
     proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     err_chunks = []
     drain = threading.Thread(target=lambda: err_chunks.append(proc.stderr.read()))
@@ -441,7 +479,7 @@ def concat_media(media_a, media_b, out_path, encoder, merge_strategy="match A", 
         _ffmpeg(), "-y", "-v", "error",
         "-i", a["path"], "-i", b["path"],
         "-filter_complex", filter_complex, "-map", "[v]",
-    ] + encoder_args(encoder, **enc_kwargs) + ["-an", out_path])
+    ] + encoder_args(encoder, width=target_w, height=target_h, fps=fps, **enc_kwargs) + ["-an", out_path])
     return media_from_path(out_path, fps_hint=fps)
 
 
@@ -880,7 +918,7 @@ class _FfmpegFrameWriter:
         args = [
             _ffmpeg(), "-y", "-v", "error",
             *rgb_input_args(self.width, self.height, self.fps),
-        ] + vf + encoder_args(encoder, **enc_kwargs) + ["-an", out_path]
+        ] + vf + encoder_args(encoder, width=enc_w, height=enc_h, fps=self.fps, **enc_kwargs) + ["-an", out_path]
         self.proc = subprocess.Popen(
             args, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
         )
