@@ -651,8 +651,8 @@ descriptions = {
          'duration': 'Duration in seconds',
         },
     }],
-  "VHS_DiskCombine": ['Disk Combine 🎥🅥🅗🅢', short_desc('Copy a disk clip into Comfy output, optionally muxing AUDIO'),
-    'Does not re-encode video. Replaces Video Combine when the images already live on disk.',
+  "VHS_DiskCombine": ['Disk Combine 🎥🅥🅗🅢', short_desc('Encode a disk clip into Comfy output as h264, optionally muxing AUDIO'),
+    'Working clips are lossless ffv1; this node is the one lossy encode. Replaces Video Combine when the images already live on disk.',
     {'Inputs': {
         'disk': 'VHS_DISK_MEDIA handle',
         'audio': 'Optional AUDIO to mux',
@@ -663,6 +663,7 @@ descriptions = {
      'Widgets': {
          'filename_prefix': 'Output name prefix',
          'save_output': 'If true, write to output directory; otherwise temp',
+         'encoder': 'Final mp4 encoder. Working files stay lossless regardless of encoder widgets on other disk nodes.',
         },
     }],
   "VHS_DiskInterpolate": ['Disk Interpolate 🎥🅥🅗🅢', short_desc('RIFE/FILM interpolate a disk clip without building an IMAGE batch in RAM'),

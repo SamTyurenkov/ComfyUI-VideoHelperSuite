@@ -19,10 +19,17 @@ from .utils import BIGMAX, BIGMIN, ENCODE_ARGS, ffmpeg_path, floatOrInt, hash_pa
 DISK_TYPE = "VHS_DISK_MEDIA"
 PREFERRED_ROOT = "/root/autodl-tmp"
 DISK_SUBDIR = "vhs_disk"
+WORKING_EXT = "mkv"
 
-# Same contract as RAM VHS: IMAGE/PNG is full-range RGB; disk h264 is TV BT.709.
-VF_RGB_FULL_TO_YUV_TV = "scale=in_color_matrix=bt709:out_color_matrix=bt709:in_range=full:out_range=tv"
-VF_YUV_TV_TO_RGB_FULL = "scale=in_color_matrix=bt709:out_color_matrix=bt709:in_range=tv:out_range=full"
+# Working clips stay full-range RGB (ffv1/gbrp). Only Disk Combine converts to TV BT.709 h264.
+VF_RGB_FULL_TO_YUV_TV = (
+    "scale=in_color_matrix=bt709:out_color_matrix=bt709:"
+    "in_range=full:out_range=tv:flags=accurate_rnd+full_chroma_int+full_chroma_inp"
+)
+VF_YUV_TV_TO_RGB_FULL = (
+    "scale=in_color_matrix=bt709:out_color_matrix=bt709:"
+    "in_range=tv:out_range=full:flags=accurate_rnd+full_chroma_int+full_chroma_inp"
+)
 SCALE_YUV_TV = "in_color_matrix=bt709:out_color_matrix=bt709:in_range=tv:out_range=tv"
 RGB_INPUT_COLOR = [
     "-color_range", "pc", "-colorspace", "rgb",
@@ -32,6 +39,13 @@ YUV_OUTPUT_COLOR = [
     "-color_range", "tv", "-colorspace", "bt709",
     "-color_primaries", "bt709", "-color_trc", "bt709",
 ]
+WORKING_OUTPUT_COLOR = [
+    "-color_range", "pc", "-colorspace", "rgb",
+    "-color_primaries", "bt709", "-color_trc", "bt709",
+]
+
+_path_refs = {}
+_path_refs_lock = threading.Lock()
 
 _nvenc_available = None
 
@@ -118,6 +132,105 @@ def resolve_disk_root(base_dir):
         except Exception as e:
             last_error = e
     raise Exception(f"Cannot create disk root: {last_error}")
+
+
+def _is_under_disk_root(path):
+    real = os.path.realpath(path)
+    for root in _allowed_write_roots():
+        try:
+            if os.path.commonpath([root, real]) == root:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _unlink_working(path):
+    if not path:
+        return
+    real = os.path.realpath(path)
+    if not _is_under_disk_root(real):
+        return
+    try:
+        if os.path.isfile(real):
+            os.remove(real)
+            logger.info("Removed working clip %s", real)
+    except OSError as e:
+        logger.warn("Could not remove %s: %s", real, e)
+
+
+def _set_refs(path, count):
+    if not path:
+        return
+    real = os.path.realpath(path)
+    with _path_refs_lock:
+        if count <= 0:
+            _path_refs.pop(real, None)
+        else:
+            _path_refs[real] = int(count)
+
+
+def _link_from(val, unique_id, slot):
+    uid = str(unique_id)
+    if isinstance(val, list) and len(val) >= 2:
+        try:
+            return str(val[0]) == uid and int(val[1]) == slot
+        except (TypeError, ValueError):
+            return False
+    if isinstance(val, dict):
+        src = val.get("node_id", val.get("id"))
+        src_slot = val.get("output_slot", val.get("slot"))
+        try:
+            return src is not None and src_slot is not None and str(src) == uid and int(src_slot) == slot
+        except (TypeError, ValueError):
+            return False
+    return False
+
+
+def count_link_consumers(prompt, unique_id, slot=0):
+    if not prompt or unique_id is None:
+        return 1
+    n = 0
+    for node in prompt.values():
+        if not isinstance(node, dict):
+            continue
+        for val in (node.get("inputs") or {}).values():
+            if _link_from(val, unique_id, slot):
+                n += 1
+    return n
+
+
+def as_working_media(media, prompt=None, unique_id=None, out_slot=0):
+    media = dict(media)
+    media["ephemeral"] = True
+    path = os.path.realpath(media["path"])
+    media["path"] = path
+    refs = count_link_consumers(prompt, unique_id, out_slot)
+    _set_refs(path, refs)
+    if refs <= 0:
+        _unlink_working(path)
+    return media
+
+
+def release_media(media):
+    if not isinstance(media, dict) or not media.get("ephemeral"):
+        return
+    path = media.get("path")
+    if not path:
+        return
+    real = os.path.realpath(path)
+    if not _is_under_disk_root(real):
+        return
+    with _path_refs_lock:
+        left = _path_refs.get(real, 1) - 1
+        if left <= 0:
+            _path_refs.pop(real, None)
+            delete = True
+        else:
+            _path_refs[real] = left
+            delete = False
+    if delete:
+        _unlink_working(real)
 
 
 def has_nvenc():
@@ -222,6 +335,13 @@ def encoder_args(encoder, width=None, height=None, fps=None, **kwargs):
     return args + YUV_OUTPUT_COLOR
 
 
+def working_encoder_args():
+    return [
+        "-c:v", "ffv1", "-level", "3", "-slices", "16", "-slicecrc", "1",
+        "-pix_fmt", "gbrp",
+    ] + WORKING_OUTPUT_COLOR
+
+
 def rgb_input_args(width, height, fps):
     return [
         "-f", "rawvideo", "-pix_fmt", "rgb24",
@@ -244,13 +364,35 @@ def yuv_to_rgb_vf(*parts):
     return ["-vf", ",".join(filters)]
 
 
-def yuv_keep_filter(scale_wh, fps):
+def is_yuv_media(media):
+    pix = str((media or {}).get("pix_fmt") or "").lower()
+    if not pix and media and media.get("path"):
+        try:
+            pix = str(probe_video(media["path"]).get("pix_fmt") or "").lower()
+            media["pix_fmt"] = pix
+        except Exception:
+            pix = ""
+    if not pix:
+        return True
+    return pix.startswith("yuv")
+
+
+def decode_to_rgb_vf(media, *parts):
+    extra = [part for part in parts if part]
+    if is_yuv_media(media):
+        return yuv_to_rgb_vf(*extra)
+    if extra:
+        return ["-vf", ",".join(extra)]
+    return []
+
+
+def rgb_keep_filter(scale_wh, fps):
     if scale_wh:
         width, height = scale_wh
-        scale = f"scale=w={width}:h={height}:{SCALE_YUV_TV}"
+        scale = f"scale=w={width}:h={height}:flags=lanczos+accurate_rnd"
     else:
-        scale = f"scale={SCALE_YUV_TV}"
-    return f"{scale},fps={fps}"
+        scale = "null"
+    return f"{scale},fps={fps},format=gbrp"
 
 
 NVENC_RATE_WIDGETS = [
@@ -274,6 +416,18 @@ def encoder_widgets():
     }
 
 
+def delivery_encoder_widgets():
+    return {
+        "encoder": (["libx264", "auto", "h264_nvenc"], {
+            "formats": {
+                "libx264": [["crf", "INT", {"default": 14, "min": 0, "max": 51, "step": 1}]],
+                "auto": NVENC_RATE_WIDGETS,
+                "h264_nvenc": NVENC_RATE_WIDGETS,
+            },
+        }),
+    }
+
+
 def run_ffmpeg(args, stdin=None):
     try:
         res = subprocess.run(args, input=stdin, capture_output=True, check=True)
@@ -289,8 +443,8 @@ def run_ffmpeg(args, stdin=None):
 
 def probe_video(path):
     args = [
-        _ffprobe(), "-v", "error", "-show_entries",
-        "stream=width,height,nb_frames,nb_read_frames,avg_frame_rate,r_frame_rate:format=duration",
+        _ffprobe(), "-v", "error",         "-show_entries",
+        "stream=width,height,nb_frames,nb_read_frames,avg_frame_rate,r_frame_rate,pix_fmt,codec_name:format=duration",
         "-select_streams", "v:0", "-of", "json", path,
     ]
     try:
@@ -327,6 +481,8 @@ def probe_video(path):
         "width": width,
         "height": height,
         "duration": duration if duration > 0 else (count / fps if fps else 0),
+        "pix_fmt": stream.get("pix_fmt") or "",
+        "codec_name": stream.get("codec_name") or "",
     }
 
 
@@ -404,11 +560,10 @@ def encode_images_to_file(images, out_path, fps, encoder, pbar=None, **enc_kwarg
     if images.ndim == 3:
         images = images.unsqueeze(0)
     height, width = int(images.shape[1]), int(images.shape[2])
-    vf, (enc_w, enc_h) = rgb_to_yuv_vf(width, height)
     args = [
         _ffmpeg(), "-y", "-v", "error",
         *rgb_input_args(width, height, fps),
-    ] + vf + encoder_args(encoder, width=enc_w, height=enc_h, fps=fps, **enc_kwargs) + ["-an", out_path]
+    ] + working_encoder_args() + ["-an", out_path]
     proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     err_chunks = []
     drain = threading.Thread(target=lambda: err_chunks.append(proc.stderr.read()))
@@ -429,7 +584,7 @@ def encode_images_to_file(images, out_path, fps, encoder, pbar=None, **enc_kwarg
         raise Exception("ffmpeg encode failed:\n" + stderr.decode(*ENCODE_ARGS))
     media = media_from_path(out_path, fps_hint=fps)
     media["count"] = int(images.shape[0])
-    media["width"], media["height"] = enc_w, enc_h
+    media["width"], media["height"] = width, height
     if media["fps"]:
         media["duration"] = media["count"] / media["fps"]
     return media
@@ -471,15 +626,14 @@ def concat_media(media_a, media_b, out_path, encoder, merge_strategy="match A", 
             if b["width"] * b["height"] > a["width"] * a["height"]:
                 target_w, target_h, fps = b["width"], b["height"], b["fps"]
                 scale_a, scale_b = True, False
-    target_w, target_h = even_size(target_w, target_h)
-    fa = yuv_keep_filter((target_w, target_h) if scale_a else None, fps)
-    fb = yuv_keep_filter((target_w, target_h) if scale_b else None, fps)
+    fa = rgb_keep_filter((target_w, target_h) if scale_a else None, fps)
+    fb = rgb_keep_filter((target_w, target_h) if scale_b else None, fps)
     filter_complex = f"[0:v]{fa}[v0];[1:v]{fb}[v1];[v0][v1]concat=n=2:v=1:a=0[v]"
     run_ffmpeg([
         _ffmpeg(), "-y", "-v", "error",
         "-i", a["path"], "-i", b["path"],
         "-filter_complex", filter_complex, "-map", "[v]",
-    ] + encoder_args(encoder, width=target_w, height=target_h, fps=fps, **enc_kwargs) + ["-an", out_path])
+    ] + working_encoder_args() + ["-an", out_path])
     return media_from_path(out_path, fps_hint=fps)
 
 
@@ -501,7 +655,12 @@ def _ffmpeg_raw(args):
 def new_clip_path(base_dir, unique_id, prefix="clip"):
     root = resolve_disk_root(base_dir)
     safe_id = re.sub(r"[^A-Za-z0-9._-]", "_", str(unique_id or uuid.uuid4().hex[:8]))
-    return os.path.join(root, f"{prefix}_{safe_id}.mp4")
+    stem = os.path.join(root, f"{prefix}_{safe_id}")
+    for ext in (".mkv", ".mp4"):
+        old = stem + ext
+        if os.path.isfile(old):
+            _unlink_working(old)
+    return stem + "." + WORKING_EXT
 
 
 def load_frame_window(media, start, count, pbar=None):
@@ -525,7 +684,7 @@ def load_frame_window(media, start, count, pbar=None):
     end = start + count - 1
     raw = _ffmpeg_raw([
         _ffmpeg(), "-v", "error", "-i", media["path"],
-        *yuv_to_rgb_vf(f"select=between(n\\,{start}\\,{end})"),
+        *decode_to_rgb_vf(media, f"select=between(n\\,{start}\\,{end})"),
         "-vsync", "0", "-frames:v", str(count),
         "-an", "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
     ])
@@ -538,7 +697,7 @@ def load_frame_window(media, start, count, pbar=None):
         raw = _ffmpeg_raw([
             _ffmpeg(), "-v", "error",
             "-sseof", f"-{leftover:.6f}", "-i", media["path"],
-            *yuv_to_rgb_vf(),
+            *decode_to_rgb_vf(media),
             "-vsync", "0", "-frames:v", str(count + extra),
             "-an", "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
         ])
@@ -571,6 +730,37 @@ def mux_audio(video_path, audio, out_path, fps, frame_count):
     run_ffmpeg(args, stdin=audio_data)
 
 
+def copy_clip(src_path, dst_path):
+    try:
+        if os.path.exists(dst_path):
+            os.remove(dst_path)
+        os.link(src_path, dst_path)
+        return
+    except OSError:
+        pass
+    run_ffmpeg([
+        _ffmpeg(), "-y", "-v", "error", "-i", src_path, "-c", "copy", "-an", dst_path,
+    ])
+
+
+def encode_delivery_file(media, out_path, encoder, **enc_kwargs):
+    media = require_media(media)
+    width, height = int(media["width"]), int(media["height"])
+    fps = float(media["fps"]) or 24.0
+    args = [_ffmpeg(), "-y", "-v", "error", "-i", media["path"]]
+    if is_yuv_media(media):
+        enc_w, enc_h = even_size(width, height)
+        if (enc_w, enc_h) != (width, height):
+            args += ["-vf", f"pad={enc_w}:{enc_h}:(ow-iw)/2:(oh-ih)/2"]
+        args += encoder_args(encoder, width=enc_w, height=enc_h, fps=fps, **enc_kwargs)
+    else:
+        vf, (enc_w, enc_h) = rgb_to_yuv_vf(width, height)
+        args += vf + encoder_args(encoder, width=enc_w, height=enc_h, fps=fps, **enc_kwargs)
+    args += ["-an", out_path]
+    run_ffmpeg(args)
+    return out_path
+
+
 class ImagesToDisk:
     @classmethod
     def INPUT_TYPES(s):
@@ -581,7 +771,7 @@ class ImagesToDisk:
                 "base_dir": ("STRING", {"default": os.path.join(PREFERRED_ROOT, DISK_SUBDIR)}),
                 **encoder_widgets(),
             },
-            "hidden": {"unique_id": "UNIQUE_ID"},
+            "hidden": {"unique_id": "UNIQUE_ID", "prompt": "PROMPT"},
         }
 
     CATEGORY = "Video Helper Suite 🎥🅥🅗🅢/disk"
@@ -589,12 +779,13 @@ class ImagesToDisk:
     RETURN_NAMES = ("disk", "count")
     FUNCTION = "save"
 
-    def save(self, images, frame_rate, base_dir, encoder, unique_id=None, **kwargs):
+    def save(self, images, frame_rate, base_dir, encoder, unique_id=None, prompt=None, **kwargs):
         out_path = new_clip_path(base_dir, unique_id, "images")
         pbar = ProgressBar(images.shape[0] if images.ndim == 4 else 1)
         media = encode_images_to_file(
             images, out_path, frame_rate, encoder, pbar, **kwargs,
         )
+        media = as_working_media(media, prompt, unique_id)
         return (media, media["count"])
 
 
@@ -639,7 +830,7 @@ class MergeDisk:
                 "base_dir": ("STRING", {"default": os.path.join(PREFERRED_ROOT, DISK_SUBDIR)}),
                 **encoder_widgets(),
             },
-            "hidden": {"unique_id": "UNIQUE_ID"},
+            "hidden": {"unique_id": "UNIQUE_ID", "prompt": "PROMPT"},
         }
 
     CATEGORY = "Video Helper Suite 🎥🅥🅗🅢/disk"
@@ -647,11 +838,14 @@ class MergeDisk:
     RETURN_NAMES = ("disk", "count")
     FUNCTION = "merge"
 
-    def merge(self, disk_A, disk_B, merge_strategy, base_dir, encoder, unique_id=None, **kwargs):
+    def merge(self, disk_A, disk_B, merge_strategy, base_dir, encoder, unique_id=None, prompt=None, **kwargs):
         out_path = new_clip_path(base_dir, unique_id, "merge")
         media = concat_media(
             disk_A, disk_B, out_path, encoder, merge_strategy, **kwargs,
         )
+        media = as_working_media(media, prompt, unique_id)
+        release_media(disk_A)
+        release_media(disk_B)
         return (media, media["count"])
 
 
@@ -665,7 +859,7 @@ class AppendImagesToDisk:
                 "base_dir": ("STRING", {"default": os.path.join(PREFERRED_ROOT, DISK_SUBDIR)}),
                 **encoder_widgets(),
             },
-            "hidden": {"unique_id": "UNIQUE_ID"},
+            "hidden": {"unique_id": "UNIQUE_ID", "prompt": "PROMPT"},
         }
 
     CATEGORY = "Video Helper Suite 🎥🅥🅗🅢/disk"
@@ -673,7 +867,7 @@ class AppendImagesToDisk:
     RETURN_NAMES = ("disk", "count")
     FUNCTION = "append"
 
-    def append(self, disk, images, base_dir, encoder, unique_id=None, **kwargs):
+    def append(self, disk, images, base_dir, encoder, unique_id=None, prompt=None, **kwargs):
         media = require_media(disk)
         tail_path = new_clip_path(base_dir, unique_id, "append_tail")
         out_path = new_clip_path(base_dir, unique_id, "append")
@@ -688,6 +882,8 @@ class AppendImagesToDisk:
             os.remove(tail_path)
         except OSError:
             pass
+        result = as_working_media(result, prompt, unique_id)
+        release_media(disk)
         return (result, result["count"])
 
 
@@ -710,6 +906,7 @@ class LoadDiskFrames:
     def load(self, disk, start, count):
         pbar = ProgressBar(max(count, 1))
         images = load_frame_window(disk, start, count, pbar)
+        release_media(disk)
         return (images, images.shape[0])
 
 
@@ -725,7 +922,7 @@ class DiskInfo:
 
     def info(self, disk):
         media = require_media(disk)
-        return (
+        out = (
             media["path"],
             float(media["fps"]),
             int(media["count"]),
@@ -733,6 +930,8 @@ class DiskInfo:
             int(media["height"]),
             float(media.get("duration") or 0),
         )
+        release_media(disk)
+        return out
 
 
 class DiskCombine:
@@ -743,6 +942,7 @@ class DiskCombine:
                 "disk": (DISK_TYPE,),
                 "filename_prefix": ("STRING", {"default": "DiskCombine"}),
                 "save_output": ("BOOLEAN", {"default": True}),
+                **delivery_encoder_widgets(),
             },
             "optional": {
                 "audio": ("AUDIO",),
@@ -759,7 +959,7 @@ class DiskCombine:
     OUTPUT_NODE = True
     FUNCTION = "combine"
 
-    def combine(self, disk, filename_prefix="DiskCombine", save_output=True, audio=None, prompt=None, extra_pnginfo=None):
+    def combine(self, disk, filename_prefix="DiskCombine", save_output=True, audio=None, prompt=None, extra_pnginfo=None, encoder="libx264", **kwargs):
         media = require_media(disk)
         output_dir = (
             folder_paths.get_output_directory()
@@ -777,7 +977,7 @@ class DiskCombine:
                 if match:
                     counter = max(counter, int(match.group(1)) + 1)
         file_path = os.path.join(full_output_folder, f"{filename}_{counter:05}.mp4")
-        run_ffmpeg([_ffmpeg(), "-y", "-v", "error", "-i", media["path"], "-c", "copy", file_path])
+        encode_delivery_file(media, file_path, encoder, **kwargs)
         output_files = [file_path]
         waveform = None
         if audio is not None:
@@ -793,6 +993,7 @@ class DiskCombine:
         else:
             preview = file_path
         embed_comfy_video_metadata(preview, prompt, extra_pnginfo)
+        release_media(disk)
         gif_preview = {
             "filename": os.path.basename(preview),
             "subfolder": subfolder,
@@ -814,6 +1015,7 @@ KNOWN_INTERP_CKPTS = [
     "rife_v4.25_heavy.safetensors",
     "film_net_fp16.safetensors",
 ]
+
 
 
 def _interp_ckpt_names():
@@ -913,12 +1115,11 @@ class _FfmpegFrameWriter:
         self.fps = float(fps)
         self.written = 0
         self.out_path = out_path
-        vf, (enc_w, enc_h) = rgb_to_yuv_vf(self.width, self.height)
-        self.enc_w, self.enc_h = enc_w, enc_h
+        self.enc_w, self.enc_h = self.width, self.height
         args = [
             _ffmpeg(), "-y", "-v", "error",
             *rgb_input_args(self.width, self.height, self.fps),
-        ] + vf + encoder_args(encoder, width=enc_w, height=enc_h, fps=self.fps, **enc_kwargs) + ["-an", out_path]
+        ] + working_encoder_args() + ["-an", out_path]
         self.proc = subprocess.Popen(
             args, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
         )
@@ -987,7 +1188,7 @@ def _iter_disk_hwc(media, every=1):
     args = [
         _ffmpeg(), "-v", "error", "-i", media["path"],
         "-vsync", "0", "-an",
-        *yuv_to_rgb_vf(select),
+        *decode_to_rgb_vf(media, select),
         "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
     ]
     proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=frame_bytes)
@@ -1032,7 +1233,7 @@ def interpolate_disk_clip(media, ckpt_name, multiplier, out_path, encoder, keep_
     width, height = int(media["width"]), int(media["height"])
     fps = float(media["fps"]) or 24.0
     if total < 2 or multiplier < 2:
-        run_ffmpeg([_ffmpeg(), "-y", "-v", "error", "-i", media["path"], "-c", "copy", "-an", out_path])
+        copy_clip(media["path"], out_path)
         copied = media_from_path(out_path, fps_hint=fps)
         copied["count"] = total
         return copied
@@ -1139,7 +1340,7 @@ class DiskInterpolate:
                 "base_dir": ("STRING", {"default": os.path.join(PREFERRED_ROOT, DISK_SUBDIR)}),
                 **encoder_widgets(),
             },
-            "hidden": {"unique_id": "UNIQUE_ID"},
+            "hidden": {"unique_id": "UNIQUE_ID", "prompt": "PROMPT"},
         }
 
     CATEGORY = "Video Helper Suite 🎥🅥🅗🅢/disk"
@@ -1147,7 +1348,7 @@ class DiskInterpolate:
     RETURN_NAMES = ("disk", "count")
     FUNCTION = "interpolate"
 
-    def interpolate(self, disk, ckpt_name, multiplier, keep_duration, base_dir, encoder, unique_id=None, **kwargs):
+    def interpolate(self, disk, ckpt_name, multiplier, keep_duration, base_dir, encoder, unique_id=None, prompt=None, **kwargs):
         media = require_media(disk)
         out_path = new_clip_path(base_dir, unique_id, "interp")
         total = max(int(media["count"]) - 1, 1) * (int(multiplier) - 1)
@@ -1156,6 +1357,8 @@ class DiskInterpolate:
             media, ckpt_name, int(multiplier), out_path, encoder,
             keep_duration=keep_duration, pbar=pbar, **kwargs,
         )
+        result = as_working_media(result, prompt, unique_id)
+        release_media(disk)
         return (result, result["count"])
 
 
@@ -1316,7 +1519,7 @@ class SplitDisk:
                 "base_dir": ("STRING", {"default": os.path.join(PREFERRED_ROOT, DISK_SUBDIR)}),
                 **encoder_widgets(),
             },
-            "hidden": {"unique_id": "UNIQUE_ID"},
+            "hidden": {"unique_id": "UNIQUE_ID", "prompt": "PROMPT"},
         }
 
     CATEGORY = "Video Helper Suite 🎥🅥🅗🅢/disk"
@@ -1324,7 +1527,7 @@ class SplitDisk:
     RETURN_NAMES = ("disk_A", "A_count", "disk_B", "B_count")
     FUNCTION = "split"
 
-    def split(self, disk, split_index, base_dir, encoder, unique_id=None, **kwargs):
+    def split(self, disk, split_index, base_dir, encoder, unique_id=None, prompt=None, **kwargs):
         media = require_media(disk)
         total = int(media["count"])
         idx = int(split_index)
@@ -1347,8 +1550,8 @@ class SplitDisk:
                     writer_b.write_hwc(frame)
                 i += 1
                 pbar.update(1)
-            a = writer_a.close()
-            b = writer_b.close()
+            a = as_working_media(writer_a.close(), prompt, unique_id, 0)
+            b = as_working_media(writer_b.close(), prompt, unique_id, 2)
         except Exception:
             try:
                 writer_a.proc.kill()
@@ -1356,6 +1559,7 @@ class SplitDisk:
             except Exception:
                 pass
             raise
+        release_media(disk)
         return (a, a["count"], b, b["count"])
 
 
@@ -1368,7 +1572,7 @@ class ReverseDisk:
                 "base_dir": ("STRING", {"default": os.path.join(PREFERRED_ROOT, DISK_SUBDIR)}),
                 **encoder_widgets(),
             },
-            "hidden": {"unique_id": "UNIQUE_ID"},
+            "hidden": {"unique_id": "UNIQUE_ID", "prompt": "PROMPT"},
         }
 
     CATEGORY = "Video Helper Suite 🎥🅥🅗🅢/disk"
@@ -1376,7 +1580,7 @@ class ReverseDisk:
     RETURN_NAMES = ("disk", "count")
     FUNCTION = "reverse"
 
-    def reverse(self, disk, base_dir, encoder, unique_id=None, **kwargs):
+    def reverse(self, disk, base_dir, encoder, unique_id=None, prompt=None, **kwargs):
         media = require_media(disk)
         width, height = int(media["width"]), int(media["height"])
         fps = float(media["fps"]) or 24.0
@@ -1385,7 +1589,7 @@ class ReverseDisk:
         raw_path = out_path + ".raw"
         args = [
             _ffmpeg(), "-v", "error", "-i", media["path"],
-            *yuv_to_rgb_vf(),
+            *decode_to_rgb_vf(media),
             "-vsync", "0", "-an", "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
         ]
         proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=frame_bytes)
@@ -1417,7 +1621,9 @@ class ReverseDisk:
                         raw.seek(i * frame_bytes)
                         writer.write_bytes(raw.read(frame_bytes))
                         pbar.update(1)
-                return (writer.close(), n)
+                result = as_working_media(writer.close(), prompt, unique_id)
+                release_media(disk)
+                return (result, n)
             except Exception:
                 try:
                     writer.proc.kill()
@@ -1450,7 +1656,7 @@ class DiskColorMatch:
                 "image_ref": ("IMAGE",),
                 "disk_ref": (DISK_TYPE,),
             },
-            "hidden": {"unique_id": "UNIQUE_ID"},
+            "hidden": {"unique_id": "UNIQUE_ID", "prompt": "PROMPT"},
         }
 
     CATEGORY = "Video Helper Suite 🎥🅥🅗🅢/disk"
@@ -1459,15 +1665,19 @@ class DiskColorMatch:
     FUNCTION = "match"
 
     def match(self, disk, method, source_stats, sample_every, chroma_only, strength, base_dir, encoder,
-              unique_id=None, image_ref=None, disk_ref=None, **kwargs):
+              unique_id=None, image_ref=None, disk_ref=None, prompt=None, **kwargs):
         media = require_media(disk)
         if image_ref is None and disk_ref is None:
             raise Exception("Provide image_ref or disk_ref — the look to match, not a per-frame pair")
         if float(strength) == 0:
             out_path = new_clip_path(base_dir, unique_id, "cm")
-            run_ffmpeg([_ffmpeg(), "-y", "-v", "error", "-i", media["path"], "-c", "copy", "-an", out_path])
+            copy_clip(media["path"], out_path)
             copied = media_from_path(out_path, fps_hint=media["fps"])
             copied["count"] = media["count"]
+            copied = as_working_media(copied, prompt, unique_id)
+            release_media(disk)
+            if disk_ref is not None:
+                release_media(disk_ref)
             return (copied, copied["count"])
 
         src_m = _collect_clip_moments(media, source_stats, sample_every, method)
@@ -1496,7 +1706,7 @@ class DiskColorMatch:
                 )
                 writer.write_hwc(out)
                 pbar.update(1)
-            result = writer.close()
+            result = as_working_media(writer.close(), prompt, unique_id)
         except Exception:
             try:
                 writer.proc.kill()
@@ -1504,6 +1714,9 @@ class DiskColorMatch:
             except Exception:
                 pass
             raise
+        release_media(disk)
+        if disk_ref is not None:
+            release_media(disk_ref)
         return (result, result["count"])
 
 
@@ -1520,7 +1733,7 @@ class DiskRTXUpscale:
                 "base_dir": ("STRING", {"default": os.path.join(PREFERRED_ROOT, DISK_SUBDIR)}),
                 **encoder_widgets(),
             },
-            "hidden": {"unique_id": "UNIQUE_ID"},
+            "hidden": {"unique_id": "UNIQUE_ID", "prompt": "PROMPT"},
         }
 
     CATEGORY = "Video Helper Suite 🎥🅥🅗🅢/disk"
@@ -1528,7 +1741,7 @@ class DiskRTXUpscale:
     RETURN_NAMES = ("disk", "count")
     FUNCTION = "upscale"
 
-    def upscale(self, disk, scale, width, height, quality, base_dir, encoder, unique_id=None, **kwargs):
+    def upscale(self, disk, scale, width, height, quality, base_dir, encoder, unique_id=None, prompt=None, **kwargs):
         try:
             import nvvfx
         except ImportError as e:
@@ -1564,7 +1777,7 @@ class DiskRTXUpscale:
                     writer.write_hwc(up.movedim(0, -1).float().clamp(0, 1))
                     del inp, up
                     pbar.update(1)
-            result = writer.close()
+            result = as_working_media(writer.close(), prompt, unique_id)
         except Exception:
             if writer is not None:
                 try:
@@ -1573,4 +1786,5 @@ class DiskRTXUpscale:
                 except Exception:
                     pass
             raise
+        release_media(disk)
         return (result, result["count"])
