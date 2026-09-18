@@ -322,7 +322,7 @@ def encoder_args(encoder, width=None, height=None, fps=None, **kwargs):
                 "-pix_fmt", "yuv420p",
             ]
     else:
-        crf = int(kwargs.get("crf", kwargs.get("quality", 18)))
+        crf = int(kwargs.get("crf", kwargs.get("quality", 14)))
         if encoder == "h264_nvenc":
             args = [
                 "-c:v", "h264_nvenc", "-preset", "p4",
@@ -400,7 +400,7 @@ NVENC_RATE_WIDGETS = [
     ["megabit", "BOOLEAN", {"default": True}],
 ]
 X264_RATE_WIDGETS = [
-    ["crf", "INT", {"default": 18, "min": 0, "max": 51, "step": 1}],
+    ["crf", "INT", {"default": 14, "min": 0, "max": 51, "step": 1}],
 ]
 
 

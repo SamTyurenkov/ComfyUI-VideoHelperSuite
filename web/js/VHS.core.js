@@ -2119,6 +2119,8 @@ app.registerExtension({
             if (nodeData?.name == "VHS_VideoCombine") {
                 addFormatWidgets(nodeType, nodeData);
                 addVAEInputToggle(nodeType, nodeData)
+            } else {
+                addFormatWidgets(nodeType, nodeData, "encoder");
             }
         } else if (["VHS_ImagesToDisk", "VHS_MergeDisk", "VHS_AppendImagesToDisk", "VHS_DiskInterpolate", "VHS_SplitDisk", "VHS_ReverseDisk", "VHS_DiskColorMatch", "VHS_DiskRTXUpscale"].includes(nodeData?.name)) {
             addFormatWidgets(nodeType, nodeData, "encoder");
