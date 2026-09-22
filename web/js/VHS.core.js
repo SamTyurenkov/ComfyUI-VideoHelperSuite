@@ -2032,6 +2032,26 @@ app.registerExtension({
                 });
             });
             addLoadCommon(nodeType, nodeData);
+        } else if (nodeData?.name == "VHS_PathToDiskUpload") {
+            chainCallback(nodeType.prototype, "onNodeCreated", function() {
+                const pathWidget = this.widgets.find((w) => w.name === "video");
+                chainCallback(pathWidget, "callback", (value) => {
+                    if (!value) {
+                        return;
+                    }
+                    let extension_index = value.lastIndexOf(".");
+                    let extension = value.slice(extension_index+1);
+                    let format = "video"
+                    if (["gif", "webp", "avif"].includes(extension)) {
+                        format = "image"
+                    }
+                    format += "/" + extension;
+                    let params = {filename : value, type : "input", format: format};
+                    this.updateParameters(params, true);
+                });
+            });
+            addUploadWidget(nodeType, nodeData, "video");
+            addVideoPreview(nodeType);
         } else if (nodeData?.name == "VHS_LoadVideo" || nodeData?.name == "VHS_LoadVideoFFmpeg") {
             chainCallback(nodeType.prototype, "onNodeCreated", function() {
                 const pathWidget = this.widgets.find((w) => w.name === "video");

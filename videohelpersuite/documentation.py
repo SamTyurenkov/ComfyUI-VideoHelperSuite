@@ -597,6 +597,15 @@ descriptions = {
          'count': 'Frame count from ffprobe',
         },
     }],
+  "VHS_PathToDiskUpload": ['Path to Disk (Upload) 🎥🅥🅗🅢', short_desc('Wrap a video from ComfyUI input/ as VHS_DISK_MEDIA without decoding frames'),
+    {'Inputs': {
+        'video': 'File in the input folder, or upload with the button',
+        },
+     'Outputs': {
+         'disk': 'VHS_DISK_MEDIA handle',
+         'count': 'Frame count from ffprobe',
+        },
+    }],
   "VHS_MergeDisk": ['Merge Disk 🎥🅥🅗🅢', short_desc('Concatenate two disk clips with ffmpeg without loading them into RAM'),
     'If resolution and fps match, this is a stream copy. Otherwise B (or A) is scaled in ffmpeg.',
     {'Inputs': {

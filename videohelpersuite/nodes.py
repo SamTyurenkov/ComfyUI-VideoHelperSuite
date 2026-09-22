@@ -20,7 +20,7 @@ from .image_latent_nodes import *
 from .load_video_nodes import LoadVideoUpload, LoadVideoPath, LoadVideoFFmpegUpload, LoadVideoFFmpegPath, LoadImagePath
 from .load_images_nodes import LoadImagesFromDirectoryUpload, LoadImagesFromDirectoryPath
 from .batched_nodes import VAEEncodeBatched, VAEDecodeBatched
-from .disk_nodes import ImagesToDisk, PathToDisk, MergeDisk, AppendImagesToDisk, \
+from .disk_nodes import ImagesToDisk, PathToDisk, PathToDiskUpload, MergeDisk, AppendImagesToDisk, \
         LoadDiskFrames, DiskInfo, DiskCombine, DiskInterpolate, SplitDisk, ReverseDisk, \
         DiskColorMatch, DiskRTXUpscale
 from .utils import ffmpeg_path, get_audio, hash_path, validate_path, requeue_workflow, \
@@ -1120,6 +1120,7 @@ NODE_CLASS_MAPPINGS = {
     # Disk-backed media (no full IMAGE tensor)
     "VHS_ImagesToDisk": ImagesToDisk,
     "VHS_PathToDisk": PathToDisk,
+    "VHS_PathToDiskUpload": PathToDiskUpload,
     "VHS_MergeDisk": MergeDisk,
     "VHS_AppendImagesToDisk": AppendImagesToDisk,
     "VHS_LoadDiskFrames": LoadDiskFrames,
@@ -1176,6 +1177,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "VHS_SelectLatest": "Select Latest 🎥🅥🅗🅢",
     "VHS_ImagesToDisk": "Images to Disk 🎥🅥🅗🅢",
     "VHS_PathToDisk": "Path to Disk 🎥🅥🅗🅢",
+    "VHS_PathToDiskUpload": "Path to Disk (Upload) 🎥🅥🅗🅢",
     "VHS_MergeDisk": "Disk Merge Images 🎥🅥🅗🅢",
     "VHS_AppendImagesToDisk": "Append Images to Disk 🎥🅥🅗🅢",
     "VHS_LoadDiskFrames": "Load Disk Frames 🎥🅥🅗🅢",

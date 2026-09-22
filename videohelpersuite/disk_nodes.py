@@ -14,7 +14,22 @@ import folder_paths
 from comfy.utils import ProgressBar
 
 from .logger import logger
-from .utils import BIGMAX, BIGMIN, ENCODE_ARGS, ffmpeg_path, floatOrInt, hash_path, strip_path, validate_path, embed_comfy_video_metadata
+from .utils import BIGMAX, BIGMIN, ENCODE_ARGS, calculate_file_hash, ffmpeg_path, floatOrInt, hash_path, strip_path, validate_path, embed_comfy_video_metadata
+
+DISK_INPUT_VIDEO_EXTENSIONS = ("mp4", "webm", "mkv", "mov", "avi")
+
+
+def input_video_filenames():
+    input_dir = folder_paths.get_input_directory()
+    files = []
+    for name in os.listdir(input_dir):
+        path = os.path.join(input_dir, name)
+        if not os.path.isfile(path):
+            continue
+        parts = name.split(".")
+        if len(parts) > 1 and parts[-1].lower() in DISK_INPUT_VIDEO_EXTENSIONS:
+            files.append(name)
+    return sorted(files)
 
 DISK_TYPE = "VHS_DISK_MEDIA"
 PREFERRED_ROOT = "/root/autodl-tmp"
@@ -817,6 +832,38 @@ class PathToDisk:
     @classmethod
     def VALIDATE_INPUTS(s, video, **kwargs):
         return validate_path(video, allow_none=True, allow_url=False)
+
+
+class PathToDiskUpload:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "video": (input_video_filenames(),),
+            },
+        }
+
+    CATEGORY = "Video Helper Suite 🎥🅥🅗🅢/disk"
+    RETURN_TYPES = (DISK_TYPE, "INT")
+    RETURN_NAMES = ("disk", "count")
+    FUNCTION = "wrap"
+
+    def wrap(self, video):
+        path = folder_paths.get_annotated_filepath(strip_path(video))
+        if not os.path.isfile(path):
+            raise Exception("video is not a valid path: " + str(video))
+        media = media_from_path(os.path.realpath(path))
+        return (media, media["count"])
+
+    @classmethod
+    def IS_CHANGED(s, video, **kwargs):
+        return calculate_file_hash(folder_paths.get_annotated_filepath(video))
+
+    @classmethod
+    def VALIDATE_INPUTS(s, video):
+        if not folder_paths.exists_annotated_filepath(video):
+            return "Invalid video file: {}".format(video)
+        return True
 
 
 class MergeDisk:
